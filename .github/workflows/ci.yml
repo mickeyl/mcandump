@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check
+      - run: cargo clippy -- -D warnings
+      - run: cargo fmt -- --check
