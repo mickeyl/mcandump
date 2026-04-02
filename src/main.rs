@@ -1,4 +1,9 @@
 use clap::{Parser, ValueEnum};
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::style::{Attribute, Print, SetAttribute};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{execute, queue};
 use std::io::{self, Write};
 use std::mem;
 use std::net::{TcpListener, TcpStream};
@@ -111,6 +116,10 @@ struct Cli {
     /// Suppress terminal frame display (TCP forwarding only)
     #[arg(short = 'q', long)]
     quiet: bool,
+
+    /// Interactive terminal UI with scrollback and search
+    #[arg(long, conflicts_with = "quiet")]
+    interactive: bool,
 
     /// Custom Zeroconf service name (default: "ECUconnect-Logger <hostname>:<port>")
     #[arg(long)]
@@ -393,10 +402,11 @@ struct ClientManager {
     clients: Mutex<Vec<ClientHandle>>,
     stats: Arc<Stats>,
     colors: Colors,
+    log_runtime: bool,
 }
 
 impl ClientManager {
-    fn new(colors: Colors) -> Self {
+    fn new(colors: Colors, log_runtime: bool) -> Self {
         Self {
             clients: Mutex::new(Vec::new()),
             stats: Arc::new(Stats {
@@ -405,6 +415,7 @@ impl ClientManager {
                 bytes_sent: AtomicU64::new(0),
             }),
             colors,
+            log_runtime,
         }
     }
 
@@ -422,6 +433,7 @@ impl ClientManager {
         let (tx, rx) = mpsc::channel::<Arc<Vec<u8>>>();
         let writer_addr = addr.clone();
         let stats = Arc::clone(&self.stats);
+        let log_runtime = self.log_runtime;
 
         // Per-client writer thread — drains the unbounded channel and writes to
         // the TCP socket.  Blocking write_all here only stalls this one client.
@@ -442,11 +454,13 @@ impl ClientManager {
                         }
                     }
                 }
-                let tag = "\x1b[33m[server]\x1b[0m";
-                eprintln!(
-                    "{} {tag} Client writer exited: {writer_addr}",
-                    timestamp_now(),
-                );
+                if log_runtime {
+                    let tag = "\x1b[33m[server]\x1b[0m";
+                    eprintln!(
+                        "{} {tag} Client writer exited: {writer_addr}",
+                        timestamp_now(),
+                    );
+                }
             })
             .expect("cannot spawn client writer thread");
 
@@ -455,12 +469,14 @@ impl ClientManager {
             tx,
             addr: addr.clone(),
         });
-        eprintln!(
-            "{} {} Client connected: {addr} (total: {})",
-            timestamp_now(),
-            self.colors.tag("server", "32"),
-            clients.len(),
-        );
+        if self.log_runtime {
+            eprintln!(
+                "{} {} Client connected: {addr} (total: {})",
+                timestamp_now(),
+                self.colors.tag("server", "32"),
+                clients.len(),
+            );
+        }
     }
 
     /// Fan out a packed frame to every client's unbounded channel.
@@ -474,13 +490,15 @@ impl ClientManager {
             } else {
                 // Receiver dropped — writer thread has exited
                 let dead = clients.swap_remove(i);
-                eprintln!(
-                    "{} {} Client disconnected: {} (total: {})",
-                    timestamp_now(),
-                    self.colors.tag("server", "33"),
-                    dead.addr,
-                    clients.len(),
-                );
+                if self.log_runtime {
+                    eprintln!(
+                        "{} {} Client disconnected: {} (total: {})",
+                        timestamp_now(),
+                        self.colors.tag("server", "33"),
+                        dead.addr,
+                        clients.len(),
+                    );
+                }
             }
         }
     }
@@ -516,18 +534,546 @@ fn run_display(rx: mpsc::Receiver<RxFrame>, iface: String, ts_mode: TimestampMod
     }
 
     let stdout = io::stdout();
-    let mut last_ts = Instant::now();
+    let mut previous_timestamp_us = None;
 
     for frame in rx {
-        let line = format_frame(&frame, &iface, ts_mode, &mut last_ts, &colors);
+        let line = format_frame(&frame, &iface, ts_mode, previous_timestamp_us, &colors);
+        previous_timestamp_us = Some(frame.timestamp_us);
         let mut out = stdout.lock();
         let _ = writeln!(out, "{line}");
     }
 }
 
+// ── Interactive display ───────────────────────────────────────────────────
+
+#[derive(Clone)]
+enum SearchQuery {
+    Bytes(Vec<u8>),
+    ArbitrationId(u32),
+}
+
+impl SearchQuery {
+    fn label(&self) -> String {
+        match self {
+            SearchQuery::Bytes(bytes) => format!(
+                "bytes {}",
+                bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            SearchQuery::ArbitrationId(can_id) => format!("arbitration ID 0x{can_id:X}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PromptKind {
+    Bytes,
+    ArbitrationId,
+}
+
+impl PromptKind {
+    fn title(self) -> &'static str {
+        match self {
+            PromptKind::Bytes => "Find bytes (hex, e.g. DE AD BE EF)",
+            PromptKind::ArbitrationId => "Find arbitration ID (hex)",
+        }
+    }
+}
+
+struct PromptState {
+    kind: PromptKind,
+    input: String,
+}
+
+struct InteractiveState {
+    frames: Vec<RxFrame>,
+    selected: usize,
+    follow_tail: bool,
+    search: Option<SearchQuery>,
+    status: String,
+    prompt: Option<PromptState>,
+}
+
+impl InteractiveState {
+    fn new() -> Self {
+        Self {
+            frames: Vec::new(),
+            selected: 0,
+            follow_tail: true,
+            search: None,
+            status:
+                "Live capture. Use arrows to scroll, / to search bytes, i to search IDs, q to exit."
+                    .to_string(),
+            prompt: None,
+        }
+    }
+
+    fn push_frame(&mut self, frame: RxFrame) {
+        self.frames.push(frame);
+        if self.follow_tail {
+            self.selected = self.frames.len().saturating_sub(1);
+        }
+    }
+
+    fn scroll_up(&mut self, lines: usize) {
+        if self.frames.is_empty() {
+            return;
+        }
+        self.follow_tail = false;
+        self.selected = self.selected.saturating_sub(lines);
+    }
+
+    fn scroll_down(&mut self, lines: usize) {
+        if self.frames.is_empty() {
+            return;
+        }
+        let last = self.frames.len().saturating_sub(1);
+        self.selected = self.selected.saturating_add(lines).min(last);
+        self.follow_tail = self.selected == last;
+    }
+
+    fn jump_top(&mut self) {
+        if self.frames.is_empty() {
+            return;
+        }
+        self.follow_tail = false;
+        self.selected = 0;
+    }
+
+    fn jump_bottom(&mut self) {
+        if self.frames.is_empty() {
+            return;
+        }
+        self.follow_tail = true;
+        self.selected = self.frames.len().saturating_sub(1);
+    }
+
+    fn start_prompt(&mut self, kind: PromptKind) {
+        self.prompt = Some(PromptState {
+            kind,
+            input: String::new(),
+        });
+        self.status = kind.title().to_string();
+    }
+
+    fn repeat_search(&mut self, forward: bool) {
+        let Some(search) = self.search.clone() else {
+            self.status = "No active search.".to_string();
+            return;
+        };
+        if self.find_match(&search, forward, false) {
+            self.status = format!("Found {}.", search.label());
+        } else {
+            self.status = format!("No match for {}.", search.label());
+        }
+    }
+
+    fn submit_prompt(&mut self) {
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
+
+        let query = match prompt.kind {
+            PromptKind::Bytes => parse_hex_bytes(&prompt.input).map(SearchQuery::Bytes),
+            PromptKind::ArbitrationId => {
+                parse_can_id(&prompt.input).map(SearchQuery::ArbitrationId)
+            }
+        };
+
+        match query {
+            Ok(search) => {
+                let label = search.label();
+                self.search = Some(search.clone());
+                if self.find_match(&search, true, true) {
+                    self.status = format!("Found {label}.");
+                } else {
+                    self.status = format!("No match for {label}.");
+                }
+            }
+            Err(err) => {
+                self.status = err;
+            }
+        }
+    }
+
+    fn find_match(&mut self, search: &SearchQuery, forward: bool, include_current: bool) -> bool {
+        if self.frames.is_empty() {
+            return false;
+        }
+
+        let len = self.frames.len();
+        let current = self.selected.min(len.saturating_sub(1));
+        let start = if include_current { 0 } else { 1 };
+
+        for step in start..len {
+            let idx = if forward {
+                (current + step) % len
+            } else {
+                (current + len - (step % len)) % len
+            };
+            if frame_matches(&self.frames[idx], search) {
+                self.selected = idx;
+                self.follow_tail = idx + 1 == len;
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn handle_key(&mut self, key: KeyEvent, page_rows: usize, stop: &AtomicBool) {
+        if let Some(prompt) = self.prompt.as_mut() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.prompt = None;
+                    self.status = "Search cancelled.".to_string();
+                }
+                KeyCode::Enter => self.submit_prompt(),
+                KeyCode::Backspace => {
+                    prompt.input.pop();
+                }
+                KeyCode::Char(c)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    prompt.input.push(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Up => self.scroll_up(1),
+            KeyCode::Down => self.scroll_down(1),
+            KeyCode::PageUp => self.scroll_up(page_rows.max(1)),
+            KeyCode::PageDown => self.scroll_down(page_rows.max(1)),
+            KeyCode::Home => self.jump_top(),
+            KeyCode::End => self.jump_bottom(),
+            KeyCode::Char('/') => self.start_prompt(PromptKind::Bytes),
+            KeyCode::Char('i') => self.start_prompt(PromptKind::ArbitrationId),
+            KeyCode::Char('n') => self.repeat_search(true),
+            KeyCode::Char('N') => self.repeat_search(false),
+            KeyCode::Char('q') => {
+                self.status = "Exiting interactive mode...".to_string();
+                stop.store(true, Ordering::SeqCst);
+            }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.status = "Exiting interactive mode...".to_string();
+                stop.store(true, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }
+
+    fn status_line(&self) -> String {
+        let frames = self.frames.len();
+        let position = if frames == 0 {
+            "0/0".to_string()
+        } else {
+            format!("{}/{}", self.selected + 1, frames)
+        };
+        let mode = if self.follow_tail { "live" } else { "paused" };
+        let search = self
+            .search
+            .as_ref()
+            .map(|search| format!("  search: {}", search.label()))
+            .unwrap_or_default();
+        format!(
+            "{}  pos: {}  mode: {}{}",
+            self.status, position, mode, search
+        )
+    }
+}
+
+struct InteractiveTerminal {
+    stdout: io::Stdout,
+}
+
+impl InteractiveTerminal {
+    fn enter() -> io::Result<Self> {
+        let mut stdout = io::stdout();
+        terminal::enable_raw_mode()?;
+        if let Err(err) = execute!(stdout, EnterAlternateScreen, Hide) {
+            let _ = terminal::disable_raw_mode();
+            return Err(err);
+        }
+        Ok(Self { stdout })
+    }
+}
+
+impl Drop for InteractiveTerminal {
+    fn drop(&mut self) {
+        let _ = execute!(self.stdout, Show, LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn run_interactive_display(
+    rx: mpsc::Receiver<RxFrame>,
+    iface: String,
+    ts_mode: TimestampMode,
+    fallback_colors: Colors,
+    stop: Arc<AtomicBool>,
+) {
+    unsafe {
+        libc::nice(10);
+    }
+
+    let mut terminal = match InteractiveTerminal::enter() {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            eprintln!("warning: interactive mode unavailable: {err}");
+            run_display(rx, iface, ts_mode, fallback_colors);
+            return;
+        }
+    };
+
+    let mut state = InteractiveState::new();
+    let tick = Duration::from_millis(50);
+    let mut needs_redraw = true;
+
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok(frame) => {
+                    state.push_frame(frame);
+                    needs_redraw = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        }
+
+        if needs_redraw {
+            if let Err(err) = draw_interactive(&mut terminal.stdout, &state, &iface, ts_mode) {
+                state.status = format!("render error: {err}");
+            } else {
+                needs_redraw = false;
+            }
+        }
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        match event::poll(tick) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) => {
+                    let rows = terminal::size().map(|(_, rows)| rows).unwrap_or(24);
+                    let page_rows = rows.saturating_sub(2) as usize;
+                    state.handle_key(key, page_rows, &stop);
+                    needs_redraw = true;
+                }
+                Ok(Event::Resize(_, _)) => needs_redraw = true,
+                Ok(_) => {}
+                Err(err) => {
+                    state.status = format!("input error: {err}");
+                    needs_redraw = true;
+                    thread::sleep(Duration::from_millis(100));
+                }
+            },
+            Ok(false) => {}
+            Err(err) => {
+                state.status = format!("poll error: {err}");
+                needs_redraw = true;
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn draw_interactive(
+    stdout: &mut io::Stdout,
+    state: &InteractiveState,
+    iface: &str,
+    ts_mode: TimestampMode,
+) -> io::Result<()> {
+    let (cols, rows) = terminal::size()?;
+    let body_rows = rows.saturating_sub(2).max(1) as usize;
+    let help_row = body_rows as u16;
+    let status_row = help_row.saturating_add(1);
+    let plain = Colors::new(false);
+
+    let total = state.frames.len();
+    let selected = if total == 0 {
+        0
+    } else {
+        state.selected.min(total.saturating_sub(1))
+    };
+
+    let top = if total <= body_rows {
+        0
+    } else if state.follow_tail {
+        total.saturating_sub(body_rows)
+    } else {
+        let half = body_rows / 2;
+        let mut top = selected.saturating_sub(half);
+        let max_top = total.saturating_sub(body_rows);
+        if top > max_top {
+            top = max_top;
+        }
+        top
+    };
+
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
+
+    for row in 0..body_rows {
+        let idx = top + row;
+        queue!(stdout, MoveTo(0, row as u16))?;
+        if idx < total {
+            let previous_timestamp_us = idx
+                .checked_sub(1)
+                .and_then(|prev_idx| state.frames.get(prev_idx))
+                .map(|frame| frame.timestamp_us);
+            let prefix = if idx == selected { '>' } else { ' ' };
+            let line = format!(
+                "{prefix}{}",
+                format_frame(
+                    &state.frames[idx],
+                    iface,
+                    ts_mode,
+                    previous_timestamp_us,
+                    &plain
+                )
+            );
+            let truncated = truncate_to_width(&line, cols as usize);
+            if idx == selected {
+                queue!(
+                    stdout,
+                    SetAttribute(Attribute::Reverse),
+                    Print(truncated),
+                    SetAttribute(Attribute::Reset)
+                )?;
+            } else {
+                queue!(stdout, Print(truncated))?;
+            }
+        }
+    }
+
+    let help = "/ bytes  i ID  n/N next/prev  arrows scroll  PgUp/PgDn page  Home/End  q quit";
+    queue!(
+        stdout,
+        MoveTo(0, help_row),
+        SetAttribute(Attribute::Reverse),
+        Print(truncate_to_width(help, cols as usize)),
+        SetAttribute(Attribute::Reset)
+    )?;
+
+    queue!(stdout, MoveTo(0, status_row), Clear(ClearType::CurrentLine))?;
+    if let Some(prompt) = &state.prompt {
+        let prompt_text = format!("{}: {}", prompt.kind.title(), prompt.input);
+        queue!(
+            stdout,
+            Print(truncate_to_width(&prompt_text, cols as usize)),
+            Show
+        )?;
+        let cursor_col = prompt_text.len().min(cols.saturating_sub(1) as usize) as u16;
+        queue!(stdout, MoveTo(cursor_col, status_row))?;
+    } else {
+        queue!(
+            stdout,
+            Print(truncate_to_width(&state.status_line(), cols as usize)),
+            Hide
+        )?;
+    }
+
+    stdout.flush()
+}
+
+fn parse_hex_bytes(input: &str) -> Result<Vec<u8>, String> {
+    let normalized = input.trim();
+    if normalized.is_empty() {
+        return Err("Enter at least one byte.".to_string());
+    }
+
+    let split_tokens: Vec<&str> = normalized
+        .split(|c: char| c.is_ascii_whitespace() || matches!(c, ':' | '-' | ','))
+        .filter(|token| !token.is_empty())
+        .collect();
+
+    if split_tokens.len() > 1 {
+        let mut bytes = Vec::with_capacity(split_tokens.len());
+        for token in split_tokens {
+            let token = token
+                .strip_prefix("0x")
+                .or_else(|| token.strip_prefix("0X"))
+                .unwrap_or(token);
+            if token.is_empty() || token.len() > 2 {
+                return Err(format!("Invalid byte token '{token}'."));
+            }
+            let byte = u8::from_str_radix(token, 16)
+                .map_err(|_| format!("Invalid byte token '{token}'."))?;
+            bytes.push(byte);
+        }
+        return Ok(bytes);
+    }
+
+    let packed = split_tokens[0]
+        .strip_prefix("0x")
+        .or_else(|| split_tokens[0].strip_prefix("0X"))
+        .unwrap_or(split_tokens[0]);
+    if packed.len() % 2 != 0 {
+        return Err("Packed byte searches need an even number of hex digits.".to_string());
+    }
+
+    let mut bytes = Vec::with_capacity(packed.len() / 2);
+    for idx in (0..packed.len()).step_by(2) {
+        let byte = u8::from_str_radix(&packed[idx..idx + 2], 16)
+            .map_err(|_| "Invalid hex byte sequence.".to_string())?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
+fn parse_can_id(input: &str) -> Result<u32, String> {
+    let token = input.trim();
+    if token.is_empty() {
+        return Err("Enter an arbitration ID in hex.".to_string());
+    }
+    let token = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+        .unwrap_or(token);
+    let can_id = u32::from_str_radix(token, 16)
+        .map_err(|_| "Arbitration ID must be hexadecimal.".to_string())?;
+    if can_id > CAN_EFF_MASK {
+        return Err(format!(
+            "Arbitration ID 0x{can_id:X} exceeds the 29-bit CAN range."
+        ));
+    }
+    Ok(can_id)
+}
+
+fn frame_matches(frame: &RxFrame, search: &SearchQuery) -> bool {
+    match search {
+        SearchQuery::Bytes(bytes) => {
+            !bytes.is_empty()
+                && frame.data[..frame.len]
+                    .windows(bytes.len())
+                    .any(|win| win == bytes)
+        }
+        SearchQuery::ArbitrationId(can_id) => frame.can_id == *can_id,
+    }
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    text.chars().take(width).collect()
+}
+
 // ── TCP server ────────────────────────────────────────────────────────────
 
-fn run_tcp_server(listener: TcpListener, manager: Arc<ClientManager>, stop: Arc<AtomicBool>) {
+fn run_tcp_server(
+    listener: TcpListener,
+    manager: Arc<ClientManager>,
+    stop: Arc<AtomicBool>,
+    log_errors: bool,
+) {
     listener
         .set_nonblocking(true)
         .expect("cannot set non-blocking");
@@ -539,7 +1085,7 @@ fn run_tcp_server(listener: TcpListener, manager: Arc<ClientManager>, stop: Arc<
                 thread::sleep(Duration::from_millis(100));
             }
             Err(e) => {
-                if !stop.load(Ordering::Relaxed) {
+                if log_errors && !stop.load(Ordering::Relaxed) {
                     eprintln!("accept error: {e}");
                 }
             }
@@ -562,6 +1108,7 @@ fn start_zeroconf(
     interface: &str,
     service_name: Option<&str>,
     colors: &Colors,
+    log_success: bool,
 ) -> Option<ZeroconfHandle> {
     let hostname = hostname();
     let instance_name = service_name
@@ -616,13 +1163,15 @@ fn start_zeroconf(
         return None;
     }
 
-    eprintln!(
-        "{} {} Service '{}' published on port {}",
-        timestamp_now(),
-        colors.tag("zeroconf", "35"),
-        instance_name,
-        port,
-    );
+    if log_success {
+        eprintln!(
+            "{} {} Service '{}' published on port {}",
+            timestamp_now(),
+            colors.tag("zeroconf", "35"),
+            instance_name,
+            port,
+        );
+    }
 
     Some(ZeroconfHandle { daemon, fullname })
 }
@@ -662,7 +1211,7 @@ fn format_frame(
     frame: &RxFrame,
     iface: &str,
     ts_mode: TimestampMode,
-    last_ts: &mut Instant,
+    previous_timestamp_us: Option<u64>,
     colors: &Colors,
 ) -> String {
     let mut out = String::with_capacity(512);
@@ -670,12 +1219,16 @@ fn format_frame(
     // Timestamp
     match ts_mode {
         TimestampMode::Absolute => {
-            out.push_str(&colors.paint(&format!("({}) ", timestamp_now()), "2"));
+            out.push_str(&colors.paint(
+                &format!("({}) ", timestamp_from_us(frame.timestamp_us)),
+                "2",
+            ));
         }
         TimestampMode::Delta => {
-            let now = Instant::now();
-            let delta = now.duration_since(*last_ts);
-            *last_ts = now;
+            let delta_us = frame
+                .timestamp_us
+                .saturating_sub(previous_timestamp_us.unwrap_or(frame.timestamp_us));
+            let delta = Duration::from_micros(delta_us);
             out.push_str(&colors.paint(
                 &format!("({:6}.{:06}) ", delta.as_secs(), delta.subsec_micros()),
                 "2",
@@ -737,6 +1290,15 @@ fn format_frame(
     out.push_str(&colors.paint("'", "2"));
 
     out
+}
+
+fn timestamp_from_us(timestamp_us: u64) -> String {
+    let secs = timestamp_us / 1_000_000;
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    let ms = (timestamp_us % 1_000_000) / 1_000;
+    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
 }
 
 // ── Port selection ────────────────────────────────────────────────────────
@@ -814,7 +1376,10 @@ fn main() {
     );
 
     let stop = Arc::new(AtomicBool::new(false));
-    let manager = Arc::new(ClientManager::new(Colors::new(!cli.no_color)));
+    let manager = Arc::new(ClientManager::new(
+        Colors::new(!cli.no_color),
+        !cli.interactive,
+    ));
 
     install_signal_handlers(stop.clone());
 
@@ -822,9 +1387,10 @@ fn main() {
     {
         let manager = manager.clone();
         let stop = stop.clone();
+        let log_errors = !cli.interactive;
         thread::Builder::new()
             .name("tcp-server".into())
-            .spawn(move || run_tcp_server(listener, manager, stop))
+            .spawn(move || run_tcp_server(listener, manager, stop, log_errors))
             .expect("cannot spawn TCP server thread");
     }
 
@@ -841,18 +1407,26 @@ fn main() {
 
     // Display thread — low priority (nice +10) so it never starves CAN reading
     // or recording.  Gets its own unbounded channel.
-    let disp_tx = if !cli.quiet {
+    let (disp_tx, display_handle) = if !cli.quiet {
         let (tx, rx) = mpsc::channel::<RxFrame>();
         let iface = cli.interface.clone();
         let ts_mode = cli.timestamp;
         let colors = Colors::new(!cli.no_color);
-        thread::Builder::new()
+        let stop = stop.clone();
+        let interactive = cli.interactive;
+        let handle = thread::Builder::new()
             .name("display".into())
-            .spawn(move || run_display(rx, iface, ts_mode, colors))
+            .spawn(move || {
+                if interactive {
+                    run_interactive_display(rx, iface, ts_mode, colors, stop);
+                } else {
+                    run_display(rx, iface, ts_mode, colors);
+                }
+            })
             .expect("cannot spawn display thread");
-        Some(tx)
+        (Some(tx), Some(handle))
     } else {
-        None
+        (None, None)
     };
 
     // Zeroconf (mandatory)
@@ -861,6 +1435,7 @@ fn main() {
         &cli.interface,
         cli.service_name.as_deref(),
         &log_colors,
+        !cli.interactive,
     ) {
         Some(h) => h,
         None => {
@@ -869,11 +1444,13 @@ fn main() {
         }
     };
 
-    eprintln!(
-        "{} {} Ready. Press Ctrl+C to stop.",
-        timestamp_now(),
-        log_colors.tag("ready", "32"),
-    );
+    if !cli.interactive {
+        eprintln!(
+            "{} {} Ready. Press Ctrl+C to stop.",
+            timestamp_now(),
+            log_colors.tag("ready", "32"),
+        );
+    }
 
     // ── Main CAN receive loop ─────────────────────────────────────────────
     //
@@ -921,6 +1498,9 @@ fn main() {
     // Drop senders to signal recorder and display threads to drain and exit.
     drop(rec_tx);
     drop(disp_tx);
+    if let Some(handle) = display_handle {
+        let _ = handle.join();
+    }
 
     eprintln!(
         "\n{} {} Shutting down...",
@@ -951,5 +1531,59 @@ fn main() {
     thread::sleep(Duration::from_millis(100));
     unsafe {
         libc::close(fd);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_frame(can_id: u32, data: &[u8]) -> RxFrame {
+        let mut payload = [0u8; 64];
+        payload[..data.len()].copy_from_slice(data);
+        RxFrame {
+            can_id,
+            is_extended: false,
+            is_fd: false,
+            brs: false,
+            esi: false,
+            len: data.len(),
+            data: payload,
+            timestamp_us: 0,
+        }
+    }
+
+    #[test]
+    fn parses_spaced_hex_bytes() {
+        assert_eq!(
+            parse_hex_bytes("DE AD BE EF").unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+    }
+
+    #[test]
+    fn parses_packed_hex_bytes() {
+        assert_eq!(
+            parse_hex_bytes("deadbeef").unwrap(),
+            vec![0xDE, 0xAD, 0xBE, 0xEF]
+        );
+    }
+
+    #[test]
+    fn rejects_odd_packed_hex_bytes() {
+        assert!(parse_hex_bytes("ABC").is_err());
+    }
+
+    #[test]
+    fn matches_byte_subsequence() {
+        let frame = sample_frame(0x123, &[0x01, 0xDE, 0xAD, 0x02]);
+        assert!(frame_matches(&frame, &SearchQuery::Bytes(vec![0xDE, 0xAD])));
+    }
+
+    #[test]
+    fn matches_arbitration_id() {
+        let frame = sample_frame(0x456, &[0x00]);
+        assert!(frame_matches(&frame, &SearchQuery::ArbitrationId(0x456)));
+        assert!(!frame_matches(&frame, &SearchQuery::ArbitrationId(0x123)));
     }
 }

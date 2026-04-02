@@ -6,6 +6,7 @@ BINDIR    ?= $(PREFIX)/bin
 MANDIR    ?= $(PREFIX)/share/man
 
 BIN       := target/release/mcandump
+MANPAGE   := man/mcandump.1
 SRC       := $(shell find src -name '*.rs') Cargo.toml Cargo.lock
 
 VERSION   := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
@@ -47,12 +48,12 @@ check:
 clippy:
 	cargo clippy -- -D warnings
 
-man:
-	@man ./man/mcandump.1
+man: $(MANPAGE)
+	@man ./$(MANPAGE)
 
-install: $(BIN)
+install: $(BIN) $(MANPAGE)
 	install -Dm755 $(BIN) $(BINDIR)/mcandump
-	install -Dm644 man/mcandump.1 $(MANDIR)/man1/mcandump.1
+	install -Dm644 $(MANPAGE) $(MANDIR)/man1/mcandump.1
 
 uninstall:
 	rm -f $(BINDIR)/mcandump
@@ -107,4 +108,5 @@ help:
 	@echo "Examples:"
 	@echo "  make run IFACE=vcan0"
 	@echo "  make run IFACE=can0 EXTRA='-t delta -q'"
+	@echo "  make run IFACE=can0 EXTRA='--interactive'"
 	@echo "  make install PREFIX=/usr/local"

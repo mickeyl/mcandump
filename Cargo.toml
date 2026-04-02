@@ -1,6 +1,6 @@
 [package]
 name = "mcandump"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2021"
 rust-version = "1.70"
 description = "CAN bus logger proxy — forwards SocketCAN traffic to CANcorder via ECUconnect Logger protocol"
@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.27"
 libc = "0.2"
 mdns-sd = "0.11"
 

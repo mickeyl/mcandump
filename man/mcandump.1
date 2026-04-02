@@ -1,0 +1,108 @@
+.TH MCANDUMP 1 "April 2026" "mcandump 2.0.0" "User Commands"
+.SH NAME
+mcandump \- SocketCAN dumper and CANcorder logger proxy
+.SH SYNOPSIS
+.B mcandump
+.RI [ OPTIONS ] " <interface>"
+.SH DESCRIPTION
+.B mcandump
+reads CAN and CAN-FD frames from a Linux SocketCAN interface, prints them in a
+candump-like terminal view, and forwards the same traffic to CANcorder clients
+via the ECUconnect Logger protocol over TCP.
+.PP
+By default it runs in line-oriented output mode. With
+.BR --interactive ,
+mcandump switches the terminal into an alternate-screen interactive viewer with
+scrollback, cursor navigation, and search.
+.SH ARGUMENTS
+.TP
+.I <interface>
+SocketCAN interface name, for example
+.BR can0 ,
+.BR vcan0 ,
+or
+.BR slcan0 .
+.SH OPTIONS
+.TP
+.BR \-t ", " \-\-timestamp " <absolute|delta|none>"
+Timestamp display mode. The default is
+.BR absolute .
+.TP
+.BR \-\-no-color
+Disable colored output.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress terminal frame display and only forward traffic over TCP.
+.TP
+.BR \-\-interactive
+Enable the interactive terminal UI. This conflicts with
+.BR --quiet .
+The interactive frame buffer has no internal size limit and grows until process
+memory is exhausted.
+.TP
+.BI \-\-service-name " <name>"
+Override the advertised Zeroconf service name.
+.TP
+.BR \-h ", " \-\-help
+Show command-line help.
+.TP
+.BR \-V ", " \-\-version
+Show version information.
+.SH INTERACTIVE MODE
+Interactive mode uses an alternate terminal screen and keeps all received
+frames in memory so older traffic can be inspected without stopping capture.
+.PP
+Available shortcuts:
+.TP
+.B Up / Down
+Move one frame up or down.
+.TP
+.B PgUp / PgDn
+Move one page up or down.
+.TP
+.B Home / End
+Jump to the oldest or newest frame.
+.TP
+.B /
+Search for a payload byte sequence in hexadecimal, for example
+.BR "DE AD BE EF" " or " deadbeef .
+.TP
+.B i
+Search for an arbitration ID in hexadecimal, for example
+.BR 123 " or " 0x18FF50E5 .
+.TP
+.B n / N
+Jump to the next or previous search result.
+.TP
+.B Esc
+Cancel the active search prompt.
+.TP
+.B q
+Exit mcandump.
+.SH EXAMPLES
+.TP
+.B mcandump can0
+Read from
+.B can0
+using the default absolute timestamps.
+.TP
+.B mcandump vcan0 -t delta
+Display inter-frame delta timestamps.
+.TP
+.B mcandump can0 --interactive
+Start the interactive viewer with scrollback and search.
+.TP
+.B mcandump can0 -q
+Forward traffic to TCP clients without writing frames to the terminal.
+.SH REQUIREMENTS
+mcandump requires Linux with SocketCAN support. Opening the CAN raw socket
+typically requires root privileges or the
+.B CAP_NET_RAW
+capability.
+.SH SEE ALSO
+.BR candump (1),
+.BR ip (8)
+.SH AUTHOR
+Dr. Michael "Mickey" Lauer
+.SH LICENSE
+MIT

@@ -45,9 +45,12 @@ can drop frames under high bus load.
   (hash-based palette), data bytes are heat-mapped by value (dim gray
   for 0x00, cyan/green/yellow/red gradient, bold red for 0xFF),
   printable ASCII in green
+- **Interactive mode** — alternate-screen terminal UI with unbounded
+  in-memory scrollback, cursor/page navigation, and search for payload
+  byte sequences or arbitration IDs
 - **Low-overhead display** — terminal output runs in a `nice(10)`
   thread so it never starves CAN reading or TCP recording
-- **Tiny footprint** — ~1.2 MB stripped binary, 3 dependencies
+- **Tiny footprint** — ~1.2 MB stripped binary, 4 dependencies
 
 ## Requirements
 
@@ -94,7 +97,24 @@ mcandump can0 --service-name "My CAN Logger"
 
 # Disable colors (for piping)
 mcandump can0 --no-color
+
+# Interactive scroll/search mode
+mcandump can0 --interactive
 ```
+
+### Interactive shortcuts
+
+- `↑` / `↓` — scroll one frame
+- `PgUp` / `PgDn` — scroll one page
+- `Home` / `End` — jump to oldest/newest frame
+- `/` — find a byte sequence, e.g. `DE AD BE EF` or `deadbeef`
+- `i` — find an arbitration ID in hex, e.g. `123` or `0x18FF50E5`
+- `n` / `N` — jump to next / previous match
+- `q` — exit `mcandump`
+- `Esc` — cancel the current search prompt
+
+In interactive mode the capture buffer grows without an internal limit;
+it is only bounded by the process memory available on the host.
 
 ### Testing with virtual CAN
 
