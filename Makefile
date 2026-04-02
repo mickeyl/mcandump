@@ -109,4 +109,6 @@ help:
 	@echo "  make run IFACE=vcan0"
 	@echo "  make run IFACE=can0 EXTRA='-t delta -q'"
 	@echo "  make run IFACE=can0 EXTRA='--interactive'"
+	@echo "  make run IFACE=can0 EXTRA='--log-file capture.log'"
+	@echo "  make run IFACE=can0 EXTRA='--log-file'"
 	@echo "  make install PREFIX=/usr/local"

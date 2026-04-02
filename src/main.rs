@@ -4,9 +4,11 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
+use std::fs::File;
 use std::io::{self, Write};
 use std::mem;
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -120,6 +122,12 @@ struct Cli {
     /// Interactive terminal UI with scrollback and search
     #[arg(long, conflicts_with = "quiet")]
     interactive: bool,
+
+    /// Write a candump-compatible log file on a background thread
+    ///
+    /// If PATH is omitted, uses candump-YYYY-MM-DD_HHMMSS.log in the current directory.
+    #[arg(short = 'f', long = "log-file", value_name = "PATH", num_args = 0..=1)]
+    log_file: Option<Option<PathBuf>>,
 
     /// Custom Zeroconf service name (default: "ECUconnect-Logger <hostname>:<port>")
     #[arg(long)]
@@ -382,6 +390,85 @@ fn pack_ecuconnect_frame(frame: &RxFrame) -> Vec<u8> {
     pkt.push(frame.len as u8);
     pkt.extend_from_slice(&frame.data[..frame.len]);
     pkt
+}
+
+fn format_candump_frame(frame: &RxFrame) -> String {
+    let id = if frame.is_extended {
+        format!("{:08X}", frame.can_id)
+    } else {
+        format!("{:03X}", frame.can_id)
+    };
+
+    let mut out = String::with_capacity(16 + frame.len * 2);
+    out.push_str(&id);
+    out.push('#');
+
+    if frame.is_fd {
+        let mut flags = 0u8;
+        if frame.brs {
+            flags |= CANFD_BRS;
+        }
+        if frame.esi {
+            flags |= CANFD_ESI;
+        }
+        out.push('#');
+        out.push(char::from(b"0123456789ABCDEF"[(flags & 0x0F) as usize]));
+    }
+
+    for &byte in &frame.data[..frame.len] {
+        out.push_str(&format!("{byte:02X}"));
+    }
+
+    out
+}
+
+fn format_candump_log_line(frame: &RxFrame, iface: &str) -> String {
+    let seconds = frame.timestamp_us / 1_000_000;
+    let micros = frame.timestamp_us % 1_000_000;
+    format!(
+        "({seconds}.{micros:06}) {iface} {}",
+        format_candump_frame(frame)
+    )
+}
+
+fn run_log_writer(rx: mpsc::Receiver<RxFrame>, iface: String, file: File) -> io::Result<()> {
+    unsafe {
+        libc::nice(10);
+    }
+
+    let mut writer = io::BufWriter::new(file);
+    for frame in rx {
+        writeln!(writer, "{}", format_candump_log_line(&frame, &iface))?;
+    }
+    writer.flush()
+}
+
+fn resolve_log_file_path(arg: Option<Option<PathBuf>>) -> Option<PathBuf> {
+    match arg {
+        None => None,
+        Some(Some(path)) => Some(path),
+        Some(None) => Some(PathBuf::from(default_candump_log_filename())),
+    }
+}
+
+fn default_candump_log_filename() -> String {
+    unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return "candump.log".to_string();
+        }
+
+        format!(
+            "candump-{year:04}-{month:02}-{day:02}_{hour:02}{minute:02}{second:02}.log",
+            year = tm.tm_year + 1900,
+            month = tm.tm_mon + 1,
+            day = tm.tm_mday,
+            hour = tm.tm_hour,
+            minute = tm.tm_min,
+            second = tm.tm_sec,
+        )
+    }
 }
 
 // ── TCP client management (per-client buffered channels) ──────────────────
@@ -1346,6 +1433,7 @@ fn install_signal_handlers(stop: Arc<AtomicBool>) {
 fn main() {
     let cli = Cli::parse();
     let log_colors = Colors::new(!cli.no_color);
+    let log_file_path = resolve_log_file_path(cli.log_file.clone());
 
     // Open CAN socket (do this early to fail fast on permission errors)
     let fd = match open_can_socket(&cli.interface, true) {
@@ -1404,6 +1492,36 @@ fn main() {
             .spawn(move || run_recorder(rec_rx, manager))
             .expect("cannot spawn recorder thread");
     }
+
+    // Background candump-compatible log writer.
+    let (log_tx, log_handle) = if let Some(ref path) = log_file_path {
+        let file = match File::create(path) {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("error: cannot open log file {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        };
+
+        if !cli.interactive {
+            eprintln!(
+                "{} {} Writing candump log to {}",
+                timestamp_now(),
+                log_colors.tag("log", "36"),
+                path.display(),
+            );
+        }
+
+        let (tx, rx) = mpsc::channel::<RxFrame>();
+        let iface = cli.interface.clone();
+        let handle = thread::Builder::new()
+            .name("log-writer".into())
+            .spawn(move || run_log_writer(rx, iface, file))
+            .expect("cannot spawn log writer thread");
+        (Some(tx), Some(handle))
+    } else {
+        (None, None)
+    };
 
     // Display thread — low priority (nice +10) so it never starves CAN reading
     // or recording.  Gets its own unbounded channel.
@@ -1487,6 +1605,11 @@ fn main() {
         // Push to recorder (unbounded — never blocks)
         let _ = rec_tx.send(frame.clone());
 
+        // Push to log writer (unbounded — never blocks)
+        if let Some(ref ltx) = log_tx {
+            let _ = ltx.send(frame.clone());
+        }
+
         // Push to display (unbounded — never blocks)
         if let Some(ref dtx) = disp_tx {
             let _ = dtx.send(frame);
@@ -1497,7 +1620,15 @@ fn main() {
 
     // Drop senders to signal recorder and display threads to drain and exit.
     drop(rec_tx);
+    drop(log_tx);
     drop(disp_tx);
+    if let Some(handle) = log_handle {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("warning: log writer failed: {e}"),
+            Err(_) => eprintln!("warning: log writer thread panicked"),
+        }
+    }
     if let Some(handle) = display_handle {
         let _ = handle.join();
     }
@@ -1551,6 +1682,53 @@ mod tests {
             data: payload,
             timestamp_us: 0,
         }
+    }
+
+    #[test]
+    fn formats_classic_candump_log_line() {
+        let mut frame = sample_frame(0x123, &[0xDE, 0xAD, 0xBE, 0xEF]);
+        frame.timestamp_us = 1_712_345_678_901_234;
+        assert_eq!(
+            format_candump_log_line(&frame, "can0"),
+            "(1712345678.901234) can0 123#DEADBEEF"
+        );
+    }
+
+    #[test]
+    fn formats_extended_fd_candump_log_line() {
+        let mut frame = sample_frame(0x18FF50E5, &[0x11, 0x22, 0x33]);
+        frame.is_extended = true;
+        frame.is_fd = true;
+        frame.brs = true;
+        frame.esi = true;
+        frame.timestamp_us = 42;
+        assert_eq!(
+            format_candump_log_line(&frame, "vcan0"),
+            "(0.000042) vcan0 18FF50E5##3112233"
+        );
+    }
+
+    #[test]
+    fn default_log_filename_looks_like_candump() {
+        let filename = default_candump_log_filename();
+        assert!(filename.starts_with("candump-"));
+        assert!(filename.ends_with(".log"));
+        assert_eq!(filename.len(), "candump-2026-04-02_123456.log".len());
+    }
+
+    #[test]
+    fn clap_accepts_log_file_without_path() {
+        let cli = Cli::try_parse_from(["mcandump", "can0", "--log-file"]).unwrap();
+        assert!(matches!(cli.log_file, Some(None)));
+    }
+
+    #[test]
+    fn clap_accepts_log_file_with_path() {
+        let cli = Cli::try_parse_from(["mcandump", "can0", "--log-file", "capture.log"]).unwrap();
+        assert_eq!(
+            resolve_log_file_path(cli.log_file),
+            Some(PathBuf::from("capture.log"))
+        );
     }
 
     #[test]

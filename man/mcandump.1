@@ -40,6 +40,20 @@ Enable the interactive terminal UI. This conflicts with
 The interactive frame buffer has no internal size limit and grows until process
 memory is exhausted.
 .TP
+.BI \-f ", " \-\-log-file " <path>"
+Write a candump-compatible compact text logfile to
+.IR path .
+Log writing happens on a dedicated background thread so slow disk I/O does not
+block CAN capture.
+.PP
+If
+.B --log-file
+is given without
+.IR path ,
+mcandump creates a logfile in the current directory using a candump-style name
+such as
+.BR candump-2026-04-02_154530.log .
+.TP
 .BI \-\-service-name " <name>"
 Override the advertised Zeroconf service name.
 .TP
@@ -91,6 +105,13 @@ Display inter-frame delta timestamps.
 .TP
 .B mcandump can0 --interactive
 Start the interactive viewer with scrollback and search.
+.TP
+.B mcandump can0 --log-file capture.log
+Write a candump-compatible logfile while capturing traffic.
+.TP
+.B mcandump can0 --log-file
+Write a candump-compatible logfile using an auto-generated candump-style
+filename in the current directory.
 .TP
 .B mcandump can0 -q
 Forward traffic to TCP clients without writing frames to the terminal.

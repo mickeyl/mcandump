@@ -48,8 +48,12 @@ can drop frames under high bus load.
 - **Interactive mode** — alternate-screen terminal UI with unbounded
   in-memory scrollback, cursor/page navigation, and search for payload
   byte sequences or arbitration IDs
+- **Candump-compatible logfile output** — optional background writer
+  thread emits the compact `candump` text log format for later replay or
+  import into other tools
 - **Low-overhead display** — terminal output runs in a `nice(10)`
-  thread so it never starves CAN reading or TCP recording
+  thread so it never starves CAN reading, TCP recording, or logfile
+  writing
 - **Tiny footprint** — ~1.2 MB stripped binary, 4 dependencies
 
 ## Requirements
@@ -100,6 +104,12 @@ mcandump can0 --no-color
 
 # Interactive scroll/search mode
 mcandump can0 --interactive
+
+# Write a candump-compatible log file on disk
+mcandump can0 --log-file capture.log
+
+# Let mcandump pick a candump-style default filename
+mcandump can0 --log-file
 ```
 
 ### Interactive shortcuts
@@ -115,6 +125,22 @@ mcandump can0 --interactive
 
 In interactive mode the capture buffer grows without an internal limit;
 it is only bounded by the process memory available on the host.
+
+### Candump Logfiles
+
+Use `--log-file <path>` to write a compact text logfile in the same
+style that `candump -L` / `candump -f` produces. If you pass
+`--log-file` without a path, `mcandump` generates a default filename in
+the current directory using the same style as `candump`, e.g.
+`candump-2026-04-02_154530.log`.
+
+```text
+(1712345678.901234) can0 123#DEADBEEF
+(1712345678.901250) can0 18FF50E5##3112233
+```
+
+The logfile writer runs on its own background thread with an unbounded
+channel, so slow disk I/O does not block the SocketCAN receive loop.
 
 ### Testing with virtual CAN
 
@@ -154,9 +180,10 @@ Each CAN frame is transmitted as a binary packet over TCP:
 ## Threading Model
 
 ```
-Main thread (default pri) : read CAN socket -> push to recorder + display channels
+Main thread (default pri) : read CAN socket -> push to recorder + display + log channels
 Recorder thread           : recv frames -> pack -> fan out to per-client channels
 Per-client writer threads : drain own channel -> write_all to TCP socket
+Log writer thread         : drain own channel -> write candump-format logfile
 Display thread (nice +10) : drain channel -> format -> print to stdout
 TCP server thread         : accept connections -> spawn per-client writers
 ```
