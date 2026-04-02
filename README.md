@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="mcandump logo" width="640">
+</p>
+
 # mcandump
 
 [![CI](https://github.com/mickeyl/mcandump/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyl/mcandump/actions/workflows/ci.yml)
