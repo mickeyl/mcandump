@@ -63,7 +63,22 @@ can drop frames under high bus load.
 ## Requirements
 
 - Linux with SocketCAN support (kernel 2.6.25+)
+- Rust stable toolchain (1.70+)
 - `CAP_NET_RAW` capability or root for raw CAN sockets
+
+## Building
+
+```bash
+make build
+```
+
+Or directly with Cargo:
+
+```bash
+cargo build --release
+```
+
+The binary is at `target/release/mcandump`.
 
 ## Installation
 
@@ -146,6 +161,40 @@ the current directory using the same style as `candump`, e.g.
 The logfile writer runs on its own background thread with an unbounded
 channel, so slow disk I/O does not block the SocketCAN receive loop.
 
+### All options
+
+| Option | Description | Default |
+|---|---|---|
+| `-t, --timestamp MODE` | `absolute`, `delta`, or `none` | `absolute` |
+| `--no-color` | Disable colored terminal output | off |
+| `-q, --quiet` | Suppress terminal display (TCP forwarding only) | off |
+| `--interactive` | Interactive terminal UI with scrollback and search | off |
+| `-f, --log-file [PATH]` | Write a candump-compatible logfile (auto-named if PATH omitted) | off |
+| `--service-name NAME` | Custom Zeroconf service name | auto |
+
+### Makefile targets
+
+Run `make` to see all available targets:
+
+```
+build      Build release binary
+run        Run with IFACE and EXTRA
+test       Quick test on vcan0 (no zeroconf)
+vcan       Create vcan0 virtual interface (requires sudo)
+vcanfd     Create vcan0 with CAN-FD MTU (requires sudo)
+man        View the man page
+install    Install binary and man page to PREFIX
+uninstall  Remove installed files
+fmt        cargo fmt
+check      cargo check
+clippy     cargo clippy
+clean      cargo clean
+release    Tag vVERSION, push tag, trigger GitHub release build
+publish    Publish to crates.io (dry-run first, 5s to abort)
+```
+
+Override the interface: `make run IFACE=vcan0`
+
 ### Testing with virtual CAN
 
 ```bash
@@ -195,6 +244,21 @@ TCP server thread         : accept connections -> spawn per-client writers
 The CAN reader never blocks on slow consumers. Each TCP client has its
 own unbounded queue — a slow client only stalls itself.
 
+## Permissions
+
+Reading raw CAN frames requires `CAP_NET_RAW`. Either run as root or
+grant the capability to the binary:
+
+```bash
+sudo setcap cap_net_raw+ep target/release/mcandump
+```
+
+## Man page
+
+```bash
+man ./man/mcandump.1
+```
+
 ## See Also
 
 - [mcangen](https://github.com/mickeyl/mcangen) — high-performance CAN
@@ -204,4 +268,8 @@ own unbounded queue — a slow client only stalls itself.
 
 ## License
 
-MIT
+[MIT](LICENSE)
+
+## Author
+
+Dr. Michael 'Mickey' Lauer <mickey@vanille-media.de>
