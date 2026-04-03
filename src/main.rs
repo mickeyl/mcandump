@@ -1290,7 +1290,7 @@ fn parse_hex_bytes(input: &str) -> Result<Vec<u8>, String> {
         .strip_prefix("0x")
         .or_else(|| split_tokens[0].strip_prefix("0X"))
         .unwrap_or(split_tokens[0]);
-    if packed.len() % 2 != 0 {
+    if !packed.len().is_multiple_of(2) {
         return Err("Packed byte searches need an even number of hex digits.".to_string());
     }
 
