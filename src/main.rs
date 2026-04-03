@@ -44,6 +44,12 @@ const FRAME_FLAG_ESI: u8 = 1 << 3;
 const CANFD_FRAME_SIZE: usize = 72;
 const CAN_FRAME_SIZE: usize = 16;
 
+// SO_TIMESTAMPING flags (from linux/net_tstamp.h)
+const SOF_TIMESTAMPING_SOFTWARE: u32 = 1 << 4;
+const SOF_TIMESTAMPING_RX_HARDWARE: u32 = 1 << 2;
+const SOF_TIMESTAMPING_RX_SOFTWARE: u32 = 1 << 3;
+const SOF_TIMESTAMPING_RAW_HARDWARE: u32 = 1 << 6;
+
 const AUTO_PORT_START: u16 = 42420;
 
 #[repr(C)]
@@ -221,7 +227,9 @@ impl Colors {
 
 // ── Socket helpers ────────────────────────────────────────────────────────
 
-fn open_can_socket(ifname: &str, enable_fd: bool) -> io::Result<i32> {
+/// Open a CAN socket. Returns `(fd, hw_timestamps)` where `hw_timestamps`
+/// is true if hardware timestamping was successfully enabled.
+fn open_can_socket(ifname: &str, enable_fd: bool) -> io::Result<(i32, bool)> {
     unsafe {
         let fd = libc::socket(PF_CAN, libc::SOCK_RAW, CAN_RAW);
         if fd < 0 {
@@ -290,6 +298,31 @@ fn open_can_socket(ifname: &str, enable_fd: bool) -> io::Result<i32> {
             mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
 
+        // Request hardware timestamps if available, otherwise kernel timestamps.
+        let ts_flags: u32 = SOF_TIMESTAMPING_RX_HARDWARE
+            | SOF_TIMESTAMPING_RX_SOFTWARE
+            | SOF_TIMESTAMPING_SOFTWARE
+            | SOF_TIMESTAMPING_RAW_HARDWARE;
+        let got_timestamping = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPING,
+            &ts_flags as *const u32 as *const libc::c_void,
+            mem::size_of::<u32>() as libc::socklen_t,
+        ) == 0;
+
+        if !got_timestamping {
+            // Fallback: kernel nanosecond software timestamps
+            let enable: libc::c_int = 1;
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_TIMESTAMPNS,
+                &enable as *const libc::c_int as *const libc::c_void,
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
         // Set receive timeout so the read loop can check the stop flag
         let tv = libc::timeval {
             tv_sec: 0,
@@ -303,7 +336,7 @@ fn open_can_socket(ifname: &str, enable_fd: bool) -> io::Result<i32> {
             mem::size_of::<libc::timeval>() as libc::socklen_t,
         );
 
-        Ok(fd)
+        Ok((fd, got_timestamping))
     }
 }
 
@@ -312,7 +345,18 @@ fn open_can_socket(ifname: &str, enable_fd: bool) -> io::Result<i32> {
 /// Returns `None` for error/RTR frames (silently skipped) or on timeout.
 fn read_frame(fd: i32) -> io::Result<Option<RxFrame>> {
     let mut buf = [0u8; CANFD_FRAME_SIZE];
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, CANFD_FRAME_SIZE) };
+    let mut cmsg_buf = [0u8; 256]; // room for ancillary timestamp data
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: CANFD_FRAME_SIZE,
+    };
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_buf.len();
+
+    let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -321,10 +365,16 @@ fn read_frame(fd: i32) -> io::Result<Option<RxFrame>> {
         return Ok(None); // runt frame
     }
 
-    let timestamp_us = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64;
+    // Extract timestamp from ancillary data.  Prefer hardware timestamps
+    // (SO_TIMESTAMPING with RAW_HARDWARE) over kernel software timestamps
+    // (SO_TIMESTAMPNS).  Fall back to userspace SystemTime if neither is
+    // available.
+    let timestamp_us = extract_timestamp_us(&msg).unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64
+    });
 
     // Both can_frame (16 bytes) and canfd_frame (72 bytes) share the same
     // first-8-byte layout: can_id(4) + len(1) + flags(1) + res(2).
@@ -363,6 +413,42 @@ fn read_frame(fd: i32) -> io::Result<Option<RxFrame>> {
         data,
         timestamp_us,
     }))
+}
+
+/// Walk the cmsg chain from recvmsg and return the best available timestamp
+/// in microseconds since the Unix epoch.
+///
+/// Priority: SO_TIMESTAMPING hardware → SO_TIMESTAMPING software → SO_TIMESTAMPNS.
+fn extract_timestamp_us(msg: &libc::msghdr) -> Option<u64> {
+    let mut best: Option<u64> = None;
+
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        while !cmsg.is_null() {
+            let hdr = &*cmsg;
+            if hdr.cmsg_level == libc::SOL_SOCKET {
+                if hdr.cmsg_type == libc::SO_TIMESTAMPING {
+                    // SO_TIMESTAMPING delivers 3 consecutive timespecs:
+                    //   [0] software, [1] deprecated, [2] hardware
+                    let data = libc::CMSG_DATA(cmsg) as *const libc::timespec;
+                    let hw = &*data.add(2);
+                    if hw.tv_sec != 0 || hw.tv_nsec != 0 {
+                        return Some(hw.tv_sec as u64 * 1_000_000 + hw.tv_nsec as u64 / 1_000);
+                    }
+                    let sw = &*data;
+                    if sw.tv_sec != 0 || sw.tv_nsec != 0 {
+                        best = Some(sw.tv_sec as u64 * 1_000_000 + sw.tv_nsec as u64 / 1_000);
+                    }
+                } else if hdr.cmsg_type == libc::SO_TIMESTAMPNS && best.is_none() {
+                    let ts = &*(libc::CMSG_DATA(cmsg) as *const libc::timespec);
+                    best = Some(ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000);
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+
+    best
 }
 
 // ── ECUconnect Logger binary protocol ─────────────────────────────────────
@@ -682,6 +768,8 @@ struct InteractiveState {
     search: Option<SearchQuery>,
     status: String,
     prompt: Option<PromptState>,
+    /// Tail pane size in rows (0 = not yet initialized, set on first split).
+    tail_size: usize,
 }
 
 impl InteractiveState {
@@ -695,6 +783,7 @@ impl InteractiveState {
                 "Live capture. Use arrows to scroll, / to search bytes, i to search IDs, q to exit."
                     .to_string(),
             prompt: None,
+            tail_size: 0,
         }
     }
 
@@ -811,7 +900,7 @@ impl InteractiveState {
         false
     }
 
-    fn handle_key(&mut self, key: KeyEvent, page_rows: usize, stop: &AtomicBool) {
+    fn handle_key(&mut self, key: KeyEvent, page_rows: usize, body_rows: usize, stop: &AtomicBool) {
         if let Some(prompt) = self.prompt.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -833,6 +922,14 @@ impl InteractiveState {
         }
 
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                // Leave at least 3 rows for the main pane + 1 for separator
+                let max_tail = body_rows.saturating_sub(4);
+                self.tail_size = (self.tail_size + 1).min(max_tail);
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.tail_size = self.tail_size.saturating_sub(1).max(3);
+            }
             KeyCode::Up => self.scroll_up(1),
             KeyCode::Down => self.scroll_down(1),
             KeyCode::PageUp => self.scroll_up(page_rows.max(1)),
@@ -935,7 +1032,7 @@ fn run_interactive_display(
         }
 
         if needs_redraw {
-            if let Err(err) = draw_interactive(&mut terminal.stdout, &state, &iface, ts_mode) {
+            if let Err(err) = draw_interactive(&mut terminal.stdout, &mut state, &iface, ts_mode) {
                 state.status = format!("render error: {err}");
             } else {
                 needs_redraw = false;
@@ -949,9 +1046,20 @@ fn run_interactive_display(
         match event::poll(tick) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => {
-                    let rows = terminal::size().map(|(_, rows)| rows).unwrap_or(24);
-                    let page_rows = rows.saturating_sub(2) as usize;
-                    state.handle_key(key, page_rows, &stop);
+                    let rows = terminal::size().map(|(_, rows)| rows).unwrap_or(24) as usize;
+                    let body_rows = rows.saturating_sub(2).max(1);
+                    let tail_rows = if !state.follow_tail && body_rows >= 12 {
+                        if state.tail_size == 0 {
+                            body_rows / 5
+                        } else {
+                            state.tail_size
+                        }
+                    } else {
+                        0
+                    };
+                    let sep_rows = if tail_rows > 0 { 1 } else { 0 };
+                    let page_rows = body_rows - tail_rows - sep_rows;
+                    state.handle_key(key, page_rows, body_rows, &stop);
                     needs_redraw = true;
                 }
                 Ok(Event::Resize(_, _)) => needs_redraw = true,
@@ -974,15 +1082,31 @@ fn run_interactive_display(
 
 fn draw_interactive(
     stdout: &mut io::Stdout,
-    state: &InteractiveState,
+    state: &mut InteractiveState,
     iface: &str,
     ts_mode: TimestampMode,
 ) -> io::Result<()> {
     let (cols, rows) = terminal::size()?;
-    let body_rows = rows.saturating_sub(2).max(1) as usize;
-    let help_row = body_rows as u16;
-    let status_row = help_row.saturating_add(1);
     let plain = Colors::new(false);
+
+    // Fixed chrome: help bar + status bar = 2 rows.
+    // When scrolled away, add a separator + tail pane (~20% of body).
+    let body_rows = rows.saturating_sub(2).max(1) as usize;
+
+    let tail_rows = if !state.follow_tail && body_rows >= 12 {
+        // Initialize tail size on first split appearance
+        if state.tail_size == 0 {
+            state.tail_size = (body_rows / 5).max(3);
+        }
+        state.tail_size
+    } else {
+        0
+    };
+    let sep_rows = if tail_rows > 0 { 1 } else { 0 };
+    let main_rows = body_rows - tail_rows - sep_rows;
+
+    let help_row = body_rows as u16;
+    let status_row = help_row + 1;
 
     let total = state.frames.len();
     let selected = if total == 0 {
@@ -991,14 +1115,15 @@ fn draw_interactive(
         state.selected.min(total.saturating_sub(1))
     };
 
-    let top = if total <= body_rows {
+    // Viewport for the main (scrollable) pane
+    let top = if total <= main_rows {
         0
     } else if state.follow_tail {
-        total.saturating_sub(body_rows)
+        total.saturating_sub(main_rows)
     } else {
-        let half = body_rows / 2;
+        let half = main_rows / 2;
         let mut top = selected.saturating_sub(half);
-        let max_top = total.saturating_sub(body_rows);
+        let max_top = total.saturating_sub(main_rows);
         if top > max_top {
             top = max_top;
         }
@@ -1007,7 +1132,8 @@ fn draw_interactive(
 
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
 
-    for row in 0..body_rows {
+    // ── Main pane (scrollable, colored) ──────────────────────────────────
+    for row in 0..main_rows {
         let idx = top + row;
         queue!(stdout, MoveTo(0, row as u16))?;
         if idx < total {
@@ -1016,18 +1142,20 @@ fn draw_interactive(
                 .and_then(|prev_idx| state.frames.get(prev_idx))
                 .map(|frame| frame.timestamp_us);
             let prefix = if idx == selected { '>' } else { ' ' };
-            let line = format!(
-                "{prefix}{}",
-                format_frame(
-                    &state.frames[idx],
-                    iface,
-                    ts_mode,
-                    previous_timestamp_us,
-                    &plain
-                )
-            );
-            let truncated = truncate_to_width(&line, cols as usize);
             if idx == selected {
+                // Plain text + reverse video — no ANSI codes to interfere
+                let line = format!(
+                    "{prefix}{}",
+                    format_frame(
+                        &state.frames[idx],
+                        iface,
+                        ts_mode,
+                        previous_timestamp_us,
+                        &plain
+                    )
+                );
+                let padded = format!("{line:<width$}", width = cols as usize);
+                let truncated = truncate_to_width(&padded, cols as usize);
                 queue!(
                     stdout,
                     SetAttribute(Attribute::Reverse),
@@ -1035,21 +1163,78 @@ fn draw_interactive(
                     SetAttribute(Attribute::Reset)
                 )?;
             } else {
+                let line = format!(
+                    "{prefix}{}",
+                    format_frame_interactive(
+                        &state.frames[idx],
+                        iface,
+                        ts_mode,
+                        previous_timestamp_us,
+                    )
+                );
+                let truncated = truncate_to_visible_width(&line, cols as usize);
                 queue!(stdout, Print(truncated))?;
             }
         }
     }
 
-    let help = "/ bytes  i ID  n/N next/prev  arrows scroll  PgUp/PgDn page  Home/End  q quit";
+    // ── Separator + tail pane ────────────────────────────────────────────
+    if tail_rows > 0 {
+        // Draw separator line
+        let sep_row = main_rows as u16;
+        let separator: String = "\u{2500}".repeat(cols as usize);
+        queue!(
+            stdout,
+            MoveTo(0, sep_row),
+            SetAttribute(Attribute::Dim),
+            Print(truncate_to_width(&separator, cols as usize)),
+            SetAttribute(Attribute::Reset)
+        )?;
+
+        // Draw tail pane (latest frames, colored)
+        let tail_start = total.saturating_sub(tail_rows);
+        for row in 0..tail_rows {
+            let screen_row = (main_rows + 1 + row) as u16; // +1 for separator
+            queue!(stdout, MoveTo(0, screen_row))?;
+            let idx = tail_start + row;
+            if idx < total {
+                let previous_timestamp_us = idx
+                    .checked_sub(1)
+                    .and_then(|prev_idx| state.frames.get(prev_idx))
+                    .map(|frame| frame.timestamp_us);
+                let line = format!(
+                    " {}",
+                    format_frame_interactive(
+                        &state.frames[idx],
+                        iface,
+                        ts_mode,
+                        previous_timestamp_us,
+                    )
+                );
+                let truncated = truncate_to_visible_width(&line, cols as usize);
+                queue!(stdout, Print(truncated))?;
+            }
+        }
+    }
+
+    // ── Help bar ─────────────────────────────────────────────────────────
+    let help = "/ bytes  i ID  n/N next/prev  arrows scroll  S-arrows split  PgUp/PgDn page  Home/End  q quit";
     queue!(
         stdout,
         MoveTo(0, help_row),
+        SetAttribute(Attribute::Reset),
         SetAttribute(Attribute::Reverse),
         Print(truncate_to_width(help, cols as usize)),
         SetAttribute(Attribute::Reset)
     )?;
 
-    queue!(stdout, MoveTo(0, status_row), Clear(ClearType::CurrentLine))?;
+    // ── Status bar ───────────────────────────────────────────────────────
+    queue!(
+        stdout,
+        MoveTo(0, status_row),
+        SetAttribute(Attribute::Reset),
+        Clear(ClearType::CurrentLine)
+    )?;
     if let Some(prompt) = &state.prompt {
         let prompt_text = format!("{}: {}", prompt.kind.title(), prompt.input);
         queue!(
@@ -1279,12 +1464,14 @@ fn timestamp_now() -> String {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = dur.as_secs();
-    let h = (secs / 3600) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
+    let secs = dur.as_secs() as libc::time_t;
     let ms = dur.subsec_millis();
-    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    format!(
+        "{:02}:{:02}:{:02}.{ms:03}",
+        tm.tm_hour, tm.tm_min, tm.tm_sec
+    )
 }
 
 fn hostname() -> String {
@@ -1292,6 +1479,130 @@ fn hostname() -> String {
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+/// Subtle per-column coloring for interactive mode.  Each column gets one
+/// muted color so columns are visually distinct without the heat-map noise.
+/// Colors are switched directly without intermediate resets to avoid flicker.
+fn format_frame_interactive(
+    frame: &RxFrame,
+    iface: &str,
+    ts_mode: TimestampMode,
+    previous_timestamp_us: Option<u64>,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(512);
+
+    // Timestamp — dim, no brackets
+    match ts_mode {
+        TimestampMode::Absolute => {
+            let _ = write!(out, "\x1b[2m{} ", timestamp_from_us(frame.timestamp_us));
+        }
+        TimestampMode::Delta => {
+            let delta_us = frame
+                .timestamp_us
+                .saturating_sub(previous_timestamp_us.unwrap_or(frame.timestamp_us));
+            let delta = Duration::from_micros(delta_us);
+            let _ = write!(
+                out,
+                "\x1b[2m{:6}.{:06} ",
+                delta.as_secs(),
+                delta.subsec_micros()
+            );
+        }
+        TimestampMode::None => {}
+    }
+
+    // Interface — dim blue (switch directly from dim)
+    let _ = write!(out, "\x1b[2;34m{iface:>8}\x1b[0m  ");
+
+    // CAN ID — stable per-ID color
+    let id_code = Colors::id_color(frame.can_id);
+    if frame.is_extended {
+        let _ = write!(out, "\x1b[{id_code}m{:08X}", frame.can_id);
+    } else {
+        let _ = write!(out, "\x1b[{id_code}m{:>8X}", frame.can_id);
+    }
+
+    // FD indicator — dim magenta
+    if frame.is_fd {
+        out.push_str("\x1b[2;35m  ##");
+        if frame.brs {
+            out.push('B');
+        }
+        if frame.esi {
+            out.push('E');
+        }
+    }
+
+    // DLC — dim
+    let _ = write!(out, "\x1b[2m  [{:2}]  ", frame.len);
+
+    // Data bytes — all in one muted cyan
+    let max_bytes: usize = if frame.is_fd { 64 } else { 8 };
+    out.push_str("\x1b[36m");
+    for (i, &b) in frame.data[..frame.len].iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let _ = write!(out, "{b:02X}");
+    }
+    // Pad remaining columns (reset color first so padding is plain)
+    out.push_str("\x1b[0m");
+    for _ in frame.len..max_bytes {
+        out.push_str("   ");
+    }
+
+    // ASCII — green
+    out.push_str("  \x1b[32m'");
+    for &b in &frame.data[..frame.len] {
+        if b.is_ascii_graphic() || b == b' ' {
+            out.push(b as char);
+        } else {
+            out.push('.');
+        }
+    }
+    out.push_str("'\x1b[0m");
+
+    out
+}
+
+/// Truncate a string containing ANSI escapes to a given visible width.
+/// Always appends a reset sequence to prevent color bleed into subsequent output.
+fn truncate_to_visible_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return "\x1b[0m".to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut visible = 0;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            // Copy the entire CSI escape sequence verbatim.
+            // Format: ESC [ <params> <final byte>
+            // The '[' (0x5B) is the CSI introducer — skip it, then skip
+            // parameter/intermediate bytes (0x20..0x3F) until the final
+            // byte (0x40..0x7E, typically a letter like 'm').
+            out.push(ch);
+            if chars.peek() == Some(&'[') {
+                out.push(chars.next().unwrap()); // consume '['
+                for inner in chars.by_ref() {
+                    out.push(inner);
+                    if ('@'..='~').contains(&inner) {
+                        break;
+                    }
+                }
+            }
+        } else {
+            if visible >= width {
+                break;
+            }
+            out.push(ch);
+            visible += 1;
+        }
+    }
+    out.push_str("\x1b[0m");
+    out
 }
 
 fn format_frame(
@@ -1306,10 +1617,9 @@ fn format_frame(
     // Timestamp
     match ts_mode {
         TimestampMode::Absolute => {
-            out.push_str(&colors.paint(
-                &format!("({}) ", timestamp_from_us(frame.timestamp_us)),
-                "2",
-            ));
+            out.push_str(
+                &colors.paint(&format!("{} ", timestamp_from_us(frame.timestamp_us)), "2"),
+            );
         }
         TimestampMode::Delta => {
             let delta_us = frame
@@ -1317,7 +1627,7 @@ fn format_frame(
                 .saturating_sub(previous_timestamp_us.unwrap_or(frame.timestamp_us));
             let delta = Duration::from_micros(delta_us);
             out.push_str(&colors.paint(
-                &format!("({:6}.{:06}) ", delta.as_secs(), delta.subsec_micros()),
+                &format!("{:6}.{:06} ", delta.as_secs(), delta.subsec_micros()),
                 "2",
             ));
         }
@@ -1380,12 +1690,14 @@ fn format_frame(
 }
 
 fn timestamp_from_us(timestamp_us: u64) -> String {
-    let secs = timestamp_us / 1_000_000;
-    let h = (secs / 3600) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
+    let secs = (timestamp_us / 1_000_000) as libc::time_t;
     let ms = (timestamp_us % 1_000_000) / 1_000;
-    format!("{h:02}:{m:02}:{s:02}.{ms:03}")
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    format!(
+        "{:02}:{:02}:{:02}.{ms:03}",
+        tm.tm_hour, tm.tm_min, tm.tm_sec
+    )
 }
 
 // ── Port selection ────────────────────────────────────────────────────────
@@ -1436,8 +1748,8 @@ fn main() {
     let log_file_path = resolve_log_file_path(cli.log_file.clone());
 
     // Open CAN socket (do this early to fail fast on permission errors)
-    let fd = match open_can_socket(&cli.interface, true) {
-        Ok(fd) => fd,
+    let (fd, hw_timestamps) = match open_can_socket(&cli.interface, true) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("error: cannot open {}: {e}", cli.interface);
             if e.raw_os_error() == Some(libc::EPERM) {
@@ -1457,10 +1769,11 @@ fn main() {
     };
 
     eprintln!(
-        "{} {} mcandump starting — interface: {}, TCP port: {port}",
+        "{} {} mcandump starting — interface: {}, TCP port: {port}, timestamps: {}",
         timestamp_now(),
         log_colors.tag("init", "34"),
         cli.interface,
+        if hw_timestamps { "hardware" } else { "software" },
     );
 
     let stop = Arc::new(AtomicBool::new(false));

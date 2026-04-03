@@ -51,7 +51,11 @@ can drop frames under high bus load.
   printable ASCII in green
 - **Interactive mode** — alternate-screen terminal UI with unbounded
   in-memory scrollback, cursor/page navigation, and search for payload
-  byte sequences or arbitration IDs
+  byte sequences or arbitration IDs. Subtle per-column color coding
+  keeps the display readable without visual noise. A live tail pane
+  appears automatically when you scroll away from the latest frames,
+  so you never lose sight of current traffic — resize it on the fly
+  with `Shift+↑`/`Shift+↓`
 - **Candump-compatible logfile output** — optional background writer
   thread emits the compact `candump` text log format for later replay or
   import into other tools
@@ -136,6 +140,8 @@ mcandump can0 --log-file
 ### Interactive shortcuts
 
 - `↑` / `↓` — scroll one frame
+- `Shift+↑` / `Shift+↓` — resize the live tail pane (visible when
+  scrolled away from the latest frames)
 - `PgUp` / `PgDn` — scroll one page
 - `Home` / `End` — jump to oldest/newest frame
 - `/` — find a byte sequence, e.g. `DE AD BE EF` or `deadbeef`
