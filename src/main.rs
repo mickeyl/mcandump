@@ -4,11 +4,14 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::style::{Attribute, Print, SetAttribute};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
 use std::mem;
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -1399,12 +1402,14 @@ fn start_zeroconf(
         }
     };
 
-    let properties = [
-        ("system", hostname.as_str()),
-        ("process", "mcandump"),
-        ("interface", "socketcan"),
-        ("channel", interface),
-    ];
+    let mut properties = HashMap::from([
+        ("process".to_string(), "mcandump".to_string()),
+        ("interface".to_string(), "socketcan".to_string()),
+        ("channel".to_string(), interface.to_string()),
+    ]);
+    if let Some(bitrate) = get_can_interface_bitrate(interface) {
+        properties.insert("bitrate".to_string(), bitrate.to_string());
+    }
 
     let info = match mdns_sd::ServiceInfo::new(
         SERVICE_TYPE,
@@ -1412,10 +1417,10 @@ fn start_zeroconf(
         &format!("{hostname}.local."),
         "",
         port,
-        &properties[..],
+        properties,
     )
     .map(|info| {
-        // In mdns-sd 0.11, an empty address list only works when addr_auto is enabled.
+        // Empty address lists only work when addr_auto is enabled.
         info.enable_addr_auto()
     }) {
         Ok(info) => info,
@@ -1483,6 +1488,33 @@ fn hostname() -> String {
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+fn get_can_interface_bitrate(ifname: &str) -> Option<u32> {
+    let ip_path = ["/usr/sbin/ip", "/sbin/ip"]
+        .into_iter()
+        .find(|candidate| Path::new(candidate).is_file())
+        .unwrap_or("ip");
+    let output = Command::new(ip_path)
+        .args(["-details", "-json", "link", "show", "dev", ifname])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_can_bitrate_from_ip_json(std::str::from_utf8(&output.stdout).ok()?)
+}
+
+fn parse_can_bitrate_from_ip_json(json: &str) -> Option<u32> {
+    let key = "\"bitrate\"";
+    let start = json.find(key)? + key.len();
+    let value = json[start..].split_once(':')?.1.trim_start();
+    let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
 
 /// Subtle per-column coloring for interactive mode.  Each column gets one
@@ -2084,5 +2116,38 @@ mod tests {
         let frame = sample_frame(0x456, &[0x00]);
         assert!(frame_matches(&frame, &SearchQuery::ArbitrationId(0x456)));
         assert!(!frame_matches(&frame, &SearchQuery::ArbitrationId(0x123)));
+    }
+
+    #[test]
+    fn parses_can_bitrate_from_ip_json() {
+        let json = r#"
+            [{
+                "ifname": "can0",
+                "linkinfo": {
+                    "info_kind": "can",
+                    "info_data": {
+                        "bitrate": 500000,
+                        "sample_point": 0.875
+                    }
+                }
+            }]
+        "#;
+        assert_eq!(parse_can_bitrate_from_ip_json(json), Some(500_000));
+    }
+
+    #[test]
+    fn ignores_missing_can_bitrate_in_ip_json() {
+        let json = r#"
+            [{
+                "ifname": "can0",
+                "linkinfo": {
+                    "info_kind": "can",
+                    "info_data": {
+                        "dbitrate": 2000000
+                    }
+                }
+            }]
+        "#;
+        assert_eq!(parse_can_bitrate_from_ip_json(json), None);
     }
 }
