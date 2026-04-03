@@ -1413,7 +1413,11 @@ fn start_zeroconf(
         "",
         port,
         &properties[..],
-    ) {
+    )
+    .map(|info| {
+        // In mdns-sd 0.11, an empty address list only works when addr_auto is enabled.
+        info.enable_addr_auto()
+    }) {
         Ok(info) => info,
         Err(e) => {
             eprintln!(

@@ -69,7 +69,7 @@ can drop frames under high bus load.
 ## Requirements
 
 - Linux with SocketCAN support (kernel 2.6.25+)
-- Rust stable toolchain (1.70+)
+- Rust toolchain 1.85+
 - `CAP_NET_RAW` capability or root for raw CAN sockets
 
 ## Building
