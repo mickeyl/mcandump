@@ -1,8 +1,8 @@
 [package]
 name = "mcandump"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "CAN bus logger proxy — forwards SocketCAN traffic to CANcorder via ECUconnect Logger protocol"
 license = "MIT"
 authors = ["Dr. Michael 'Mickey' Lauer <mickey@vanille-media.de>"]
