@@ -59,7 +59,11 @@ uninstall:
 	rm -f $(BINDIR)/mcandump
 	rm -f $(MANDIR)/man1/mcandump.1
 
-release: build
+preflight:
+	cargo fmt -- --check
+	cargo clippy -- -D warnings
+
+release: preflight build
 	@if git diff --quiet && git diff --cached --quiet; then \
 		echo "Working tree clean — tagging v$(VERSION)"; \
 	else \
@@ -98,6 +102,7 @@ help:
 	@echo "  fmt        cargo fmt"
 	@echo "  check      cargo check"
 	@echo "  clippy     cargo clippy"
+	@echo "  preflight  Run fmt --check and clippy (same as CI)"
 	@echo "  clean      cargo clean"
 	@echo "  release    Tag v$$VERSION, push tag, trigger GitHub release build"
 	@echo "  publish    Publish to crates.io (dry-run first, 5s to abort)"

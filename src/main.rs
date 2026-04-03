@@ -354,7 +354,7 @@ fn read_frame(fd: i32) -> io::Result<Option<RxFrame>> {
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_buf.len();
+    msg.msg_controllen = cmsg_buf.len() as _;
 
     let n = unsafe { libc::recvmsg(fd, &mut msg, 0) };
     if n < 0 {
@@ -1464,7 +1464,7 @@ fn timestamp_now() -> String {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = dur.as_secs() as libc::time_t;
+    let secs = dur.as_secs() as i64;
     let ms = dur.subsec_millis();
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&secs, &mut tm) };
@@ -1690,7 +1690,7 @@ fn format_frame(
 }
 
 fn timestamp_from_us(timestamp_us: u64) -> String {
-    let secs = (timestamp_us / 1_000_000) as libc::time_t;
+    let secs = (timestamp_us / 1_000_000) as i64;
     let ms = (timestamp_us % 1_000_000) / 1_000;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&secs, &mut tm) };
@@ -1773,7 +1773,11 @@ fn main() {
         timestamp_now(),
         log_colors.tag("init", "34"),
         cli.interface,
-        if hw_timestamps { "hardware" } else { "software" },
+        if hw_timestamps {
+            "hardware"
+        } else {
+            "software"
+        },
     );
 
     let stop = Arc::new(AtomicBool::new(false));
