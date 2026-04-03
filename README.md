@@ -60,6 +60,8 @@ can drop frames under high bus load.
   writing
 - **Tiny footprint** — ~1.2 MB stripped binary, 4 dependencies
 
+![Interactive session](screenshot.png)
+
 ## Requirements
 
 - Linux with SocketCAN support (kernel 2.6.25+)
