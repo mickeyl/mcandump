@@ -1098,7 +1098,7 @@ impl InteractiveState {
         } else if self.follow_tail {
             "live"
         } else {
-            "paused"
+            "browsing"
         };
         let selection = match (self.select_anchor, self.selection_range()) {
             (Some(_), Some((a, b))) => format!("  sel: {}", b - a + 1),
