@@ -391,7 +391,7 @@ impl Colors {
     // colored themes, so the light variants use explicit 256-color grays /
     // dark hues instead.
     fn dim_code(&self) -> &'static str {
-        if self.is_light { "38;5;244" } else { "2" }
+        if self.is_light { "38;5;240" } else { "2" }
     }
     fn iface_code(&self) -> &'static str {
         if self.is_light { "38;5;24" } else { "2;34" }
@@ -898,7 +898,7 @@ fn run_display(rx: mpsc::Receiver<RxFrame>, iface: String, ts_mode: TimestampMod
     let mut previous_timestamp_us = None;
 
     for frame in rx {
-        let line = format_frame(&frame, &iface, ts_mode, previous_timestamp_us, &colors);
+        let line = format_frame(&frame, &iface, ts_mode, previous_timestamp_us, &colors, true);
         previous_timestamp_us = Some(frame.timestamp_us);
         let mut out = stdout.lock();
         let _ = writeln!(out, "{line}");
@@ -987,8 +987,7 @@ impl InteractiveState {
             selected: 0,
             follow_tail: true,
             search: None,
-            status: "Live capture. Arrows scroll · / i search · v select · y copy · q quit."
-                .to_string(),
+            status: String::new(),
             prompt: None,
             tail_size: 0,
             select_anchor: None,
@@ -1009,6 +1008,15 @@ impl InteractiveState {
             None => return Some((cursor, cursor)),
         };
         Some((anchor.min(cursor), anchor.max(cursor)))
+    }
+
+    fn clear_buffer(&mut self) {
+        let n = self.frames.len();
+        self.frames.clear();
+        self.selected = 0;
+        self.follow_tail = true;
+        self.select_anchor = None;
+        self.status = format!("Cleared {n} frame{}.", if n == 1 { "" } else { "s" });
     }
 
     fn toggle_visual(&mut self) {
@@ -1261,11 +1269,12 @@ impl InteractiveState {
                 self.status = "Exiting interactive mode...".to_string();
                 stop.store(true, Ordering::SeqCst);
             }
+            KeyCode::Char('c') => self.clear_buffer(),
             _ => {}
         }
     }
 
-    fn status_line(&self) -> String {
+    fn status_line(&self, iface: &str) -> String {
         let frames = self.frames.len();
         let position = if frames == 0 {
             "0/0".to_string()
@@ -1288,10 +1297,12 @@ impl InteractiveState {
             .as_ref()
             .map(|search| format!("  search: {}", search.label()))
             .unwrap_or_default();
-        format!(
-            "{}  pos: {}  mode: {}{}{}",
-            self.status, position, mode, selection, search
-        )
+        let prefix = if self.status.is_empty() {
+            String::new()
+        } else {
+            format!("{}  ", self.status)
+        };
+        format!("{prefix}pos: {position}  {iface}: {mode}{selection}{search}")
     }
 }
 
@@ -1488,7 +1499,8 @@ fn draw_interactive(
                         iface,
                         ts_mode,
                         previous_timestamp_us,
-                        &plain
+                        &plain,
+                        false,
                     )
                 );
                 let padded = format!("{line:<width$}", width = cols as usize);
@@ -1505,7 +1517,6 @@ fn draw_interactive(
                     "{prefix}{}",
                     format_frame_interactive(
                         &state.frames[idx],
-                        iface,
                         ts_mode,
                         previous_timestamp_us,
                         colors,
@@ -1545,7 +1556,6 @@ fn draw_interactive(
                     " {}",
                     format_frame_interactive(
                         &state.frames[idx],
-                        iface,
                         ts_mode,
                         previous_timestamp_us,
                         colors,
@@ -1559,7 +1569,7 @@ fn draw_interactive(
 
     // ── Help bar ─────────────────────────────────────────────────────────
     let help =
-        "/ bytes  i ID  n/N next  v sel  y copy  Y hex  V all-matches  arrows scroll  q quit";
+        "/ bytes  i ID  n/N next  v sel  y copy  Y hex  V all-matches  c clear  arrows scroll  q quit";
     queue!(
         stdout,
         MoveTo(0, help_row),
@@ -1588,7 +1598,7 @@ fn draw_interactive(
     } else {
         queue!(
             stdout,
-            Print(truncate_to_width(&state.status_line(), cols as usize)),
+            Print(truncate_to_width(&state.status_line(iface), cols as usize)),
             Hide
         )?;
     }
@@ -1901,7 +1911,6 @@ fn parse_can_bitrate_from_ip_json(json: &str) -> Option<u32> {
 /// Colors are switched directly without intermediate resets to avoid flicker.
 fn format_frame_interactive(
     frame: &RxFrame,
-    iface: &str,
     ts_mode: TimestampMode,
     previous_timestamp_us: Option<u64>,
     colors: &Colors,
@@ -1931,8 +1940,9 @@ fn format_frame_interactive(
         TimestampMode::None => {}
     }
 
-    // Interface
-    let _ = write!(out, "\x1b[{}m{iface:>8}\x1b[0m  ", colors.iface_code());
+    // (Interface name is shown once in the status bar for the interactive TUI
+    // — it's a constant for the life of the session, so repeating it per row
+    // just wastes screen real estate.)
 
     // CAN ID — stable per-ID color
     let id_code = colors.id_color(frame.can_id);
@@ -2029,6 +2039,7 @@ fn format_frame(
     ts_mode: TimestampMode,
     previous_timestamp_us: Option<u64>,
     colors: &Colors,
+    show_iface: bool,
 ) -> String {
     let mut out = String::with_capacity(512);
 
@@ -2055,8 +2066,10 @@ fn format_frame(
     }
 
     // Interface
-    out.push_str(&colors.paint(&format!("{iface:>8}"), colors.iface_code()));
-    out.push_str("  ");
+    if show_iface {
+        out.push_str(&colors.paint(&format!("{iface:>8}"), colors.iface_code()));
+        out.push_str("  ");
+    }
 
     // CAN ID — always 8 chars wide (padded), stable per-ID color
     let id_code = colors.id_color(frame.can_id);

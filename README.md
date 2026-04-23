@@ -61,13 +61,16 @@ can drop frames under high bus load.
 - **Interactive mode** — alternate-screen terminal UI with unbounded
   in-memory scrollback, cursor/page navigation, and search for payload
   byte sequences or arbitration IDs. Subtle per-column color coding
-  keeps the display readable without visual noise. A live tail pane
-  appears automatically when you scroll away from the latest frames,
-  so you never lose sight of current traffic — resize it on the fly
-  with `Shift+↑`/`Shift+↓`. Vim-style visual selection (`v` + nav +
-  `y`) copies arbitrary ranges of frames straight to the system
+  keeps the display readable without visual noise; the interface name
+  and session mode are shown once in the status bar (e.g.
+  `pos: 287/287  can0: live`) instead of on every row. A live tail
+  pane appears automatically when you scroll away from the latest
+  frames, so you never lose sight of current traffic — resize it on
+  the fly with `Shift+↑`/`Shift+↓`. Vim-style visual selection (`v` +
+  nav + `y`) copies arbitrary ranges of frames straight to the system
   clipboard via OSC 52 — no `xclip`/`wl-copy`/`pbcopy` needed, works
-  over SSH
+  over SSH. Press `c` to clear the in-memory buffer without leaving
+  the session
 - **Candump-compatible logfile output** — optional background writer
   thread emits the compact `candump` text log format for later replay or
   import into other tools

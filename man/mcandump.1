@@ -93,6 +93,9 @@ Show version information.
 .SH INTERACTIVE MODE
 Interactive mode uses an alternate terminal screen and keeps all received
 frames in memory so older traffic can be inspected without stopping capture.
+The interface name is shown once in the status bar at the bottom
+.RB ( "pos: N/M  <iface>: <mode>" ),
+not on every row, so the payload and ASCII columns get the full line width.
 .PP
 Available shortcuts:
 .TP
@@ -152,6 +155,11 @@ down with
 .BR /
 or
 .BR i .
+.TP
+.B c
+Clear the in-memory frame buffer, reset the cursor to the top, and resume
+following the tail. Useful for starting a fresh observation window without
+leaving the interactive session.
 .TP
 .B Esc
 Cancel the active search prompt or the active visual selection.
