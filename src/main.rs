@@ -138,7 +138,13 @@ struct Cli {
     #[arg(short = 'f', long = "log-file", value_name = "PATH", num_args = 0..=1)]
     log_file: Option<Option<PathBuf>>,
 
-    /// Custom Zeroconf service name (default: "ECUconnect-Logger <hostname>:<port>")
+    /// Enable the CANcorder logger: bind a TCP server and announce it via
+    /// Zeroconf so CANcorder clients can connect. Off by default — without
+    /// this flag mcandump behaves like candump with no network side effects.
+    #[arg(long)]
+    serve: bool,
+
+    /// Custom Zeroconf service name (default: "ECUconnect-Logger <hostname>:<port>"). Implies --serve.
     #[arg(long)]
     service_name: Option<String>,
 }
@@ -1782,6 +1788,9 @@ fn main() {
     let cli = Cli::parse();
     let log_colors = Colors::new(!cli.no_color);
     let log_file_path = resolve_log_file_path(cli.log_file.clone());
+    // --service-name is only meaningful when the logger is enabled; treat it
+    // as an implicit --serve so users don't have to spell both out.
+    let serve = cli.serve || cli.service_name.is_some();
 
     // Open CAN socket (do this early to fail fast on permission errors)
     let (fd, hw_timestamps) = match open_can_socket(&cli.interface, true) {
@@ -1795,56 +1804,78 @@ fn main() {
         }
     };
 
-    // Bind TCP server
-    let (listener, port) = match bind_tcp() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: cannot bind TCP port: {e}");
-            std::process::exit(1);
+    // Optional: bind TCP server when the CANcorder logger is enabled.
+    let (listener, port) = if serve {
+        match bind_tcp() {
+            Ok((l, p)) => (Some(l), Some(p)),
+            Err(e) => {
+                eprintln!("error: cannot bind TCP port: {e}");
+                std::process::exit(1);
+            }
         }
+    } else {
+        (None, None)
     };
 
-    eprintln!(
-        "{} {} mcandump starting — interface: {}, TCP port: {port}, timestamps: {}",
-        timestamp_now(),
-        log_colors.tag("init", "34"),
-        cli.interface,
-        if hw_timestamps {
-            "hardware"
-        } else {
-            "software"
-        },
-    );
+    match port {
+        Some(p) => eprintln!(
+            "{} {} mcandump starting — interface: {}, TCP port: {p}, timestamps: {}",
+            timestamp_now(),
+            log_colors.tag("init", "34"),
+            cli.interface,
+            if hw_timestamps {
+                "hardware"
+            } else {
+                "software"
+            },
+        ),
+        None => eprintln!(
+            "{} {} mcandump starting — interface: {}, timestamps: {} (logger off; pass --serve to enable CANcorder)",
+            timestamp_now(),
+            log_colors.tag("init", "34"),
+            cli.interface,
+            if hw_timestamps {
+                "hardware"
+            } else {
+                "software"
+            },
+        ),
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
-    let manager = Arc::new(ClientManager::new(
-        Colors::new(!cli.no_color),
-        !cli.interactive,
-    ));
 
     install_signal_handlers(stop.clone());
 
-    // TCP server thread
-    {
-        let manager = manager.clone();
-        let stop = stop.clone();
-        let log_errors = !cli.interactive;
-        thread::Builder::new()
-            .name("tcp-server".into())
-            .spawn(move || run_tcp_server(listener, manager, stop, log_errors))
-            .expect("cannot spawn TCP server thread");
-    }
+    // TCP server + recorder (only when --serve).
+    let (manager, rec_tx) = if let Some(listener) = listener {
+        let manager = Arc::new(ClientManager::new(
+            Colors::new(!cli.no_color),
+            !cli.interactive,
+        ));
+        {
+            let manager = manager.clone();
+            let stop = stop.clone();
+            let log_errors = !cli.interactive;
+            thread::Builder::new()
+                .name("tcp-server".into())
+                .spawn(move || run_tcp_server(listener, manager, stop, log_errors))
+                .expect("cannot spawn TCP server thread");
+        }
 
-    // Recording thread — drains the unbounded channel, packs frames, and fans
-    // out to per-client writer threads.  Never blocks on slow clients.
-    let (rec_tx, rec_rx) = mpsc::channel::<RxFrame>();
-    {
-        let manager = manager.clone();
-        thread::Builder::new()
-            .name("recorder".into())
-            .spawn(move || run_recorder(rec_rx, manager))
-            .expect("cannot spawn recorder thread");
-    }
+        // Recording thread — drains the unbounded channel, packs frames, and
+        // fans out to per-client writer threads.  Never blocks on slow clients.
+        let (rec_tx, rec_rx) = mpsc::channel::<RxFrame>();
+        {
+            let manager = manager.clone();
+            thread::Builder::new()
+                .name("recorder".into())
+                .spawn(move || run_recorder(rec_rx, manager))
+                .expect("cannot spawn recorder thread");
+        }
+        (Some(manager), Some(rec_tx))
+    } else {
+        (None, None)
+    };
 
     // Background candump-compatible log writer.
     let (log_tx, log_handle) = if let Some(ref path) = log_file_path {
@@ -1900,19 +1931,23 @@ fn main() {
         (None, None)
     };
 
-    // Zeroconf (mandatory)
-    let zeroconf = match start_zeroconf(
-        port,
-        &cli.interface,
-        cli.service_name.as_deref(),
-        &log_colors,
-        !cli.interactive,
-    ) {
-        Some(h) => h,
-        None => {
-            eprintln!("error: zeroconf service registration failed — cannot proceed");
-            std::process::exit(1);
+    // Zeroconf (only when the CANcorder logger is enabled).
+    let zeroconf = if let Some(port) = port {
+        match start_zeroconf(
+            port,
+            &cli.interface,
+            cli.service_name.as_deref(),
+            &log_colors,
+            !cli.interactive,
+        ) {
+            Some(h) => Some(h),
+            None => {
+                eprintln!("error: zeroconf service registration failed — cannot proceed");
+                std::process::exit(1);
+            }
         }
+    } else {
+        None
     };
 
     if !cli.interactive {
@@ -1956,7 +1991,9 @@ fn main() {
         frame_count += 1;
 
         // Push to recorder (unbounded — never blocks)
-        let _ = rec_tx.send(frame.clone());
+        if let Some(ref rtx) = rec_tx {
+            let _ = rtx.send(frame.clone());
+        }
 
         // Push to log writer (unbounded — never blocks)
         if let Some(ref ltx) = log_tx {
@@ -1993,9 +2030,6 @@ fn main() {
     );
 
     let elapsed = start_time.elapsed();
-    let tcp_sent = manager.stats.frames_sent.load(Ordering::Relaxed);
-    let tcp_dropped = manager.stats.frames_dropped.load(Ordering::Relaxed);
-    let tcp_bytes = manager.stats.bytes_sent.load(Ordering::Relaxed);
 
     eprintln!(
         "{} {} Frames received: {frame_count}, duration: {:.1}s",
@@ -2003,16 +2037,25 @@ fn main() {
         log_colors.tag("stats", "34"),
         elapsed.as_secs_f64(),
     );
-    eprintln!(
-        "{} {} TCP: sent: {tcp_sent}, dropped: {tcp_dropped}, bytes: {tcp_bytes}",
-        timestamp_now(),
-        log_colors.tag("stats", "34"),
-    );
+    if let Some(ref manager) = manager {
+        let tcp_sent = manager.stats.frames_sent.load(Ordering::Relaxed);
+        let tcp_dropped = manager.stats.frames_dropped.load(Ordering::Relaxed);
+        let tcp_bytes = manager.stats.bytes_sent.load(Ordering::Relaxed);
+        eprintln!(
+            "{} {} TCP: sent: {tcp_sent}, dropped: {tcp_dropped}, bytes: {tcp_bytes}",
+            timestamp_now(),
+            log_colors.tag("stats", "34"),
+        );
+    }
 
-    stop_zeroconf(zeroconf, &log_colors);
-    manager.close_all();
-    // Give writer threads a moment to drain and exit after close_all drops senders.
-    thread::sleep(Duration::from_millis(100));
+    if let Some(z) = zeroconf {
+        stop_zeroconf(z, &log_colors);
+    }
+    if let Some(manager) = manager {
+        manager.close_all();
+        // Give writer threads a moment to drain and exit after close_all drops senders.
+        thread::sleep(Duration::from_millis(100));
+    }
     unsafe {
         libc::close(fd);
     }

@@ -12,10 +12,12 @@
 ![Rust](https://img.shields.io/badge/language-Rust-orange)
 
 CAN bus logger proxy for Linux, built in Rust. Reads CAN and CAN-FD
-frames from a SocketCAN interface, displays them on the terminal (like
-`candump`), and simultaneously forwards them to
+frames from a SocketCAN interface and displays them on the terminal
+(like `candump`). Add `--serve` to turn it into a CANcorder logger that
+also forwards traffic to
 [CANcorder](https://apps.apple.com/app/cancorder/id6743640770) clients
-via the ECUconnect Logger binary protocol over TCP.
+via the ECUconnect Logger binary protocol over TCP, announced via
+Zeroconf/mDNS.
 
 ## Why?
 
@@ -40,11 +42,15 @@ can drop frames under high bus load.
 
 - **CAN and CAN-FD** — classic 8-byte frames and FD frames up to 64
   bytes, with BRS and ESI flag support
+- **Opt-in CANcorder logger** — pass `--serve` to bind a TCP server and
+  announce it via Zeroconf. Without it, mcandump is a pure terminal
+  dumper with zero network side effects (mirrors `candump`)
 - **Zero-drop architecture** — the CAN reader only pushes to unbounded
   channels; a dedicated recorder thread fans out to per-client writer
   threads
-- **Zeroconf discovery** — publishes `_ecuconnect-log._tcp.local.` so
-  CANcorder finds the logger automatically
+- **Zeroconf discovery** — when `--serve` is active, publishes
+  `_ecuconnect-log._tcp.local.` so CANcorder finds the logger
+  automatically
 - **Rich terminal output** — CAN IDs get a stable per-ID color
   (hash-based palette), data bytes are heat-mapped by value (dim gray
   for 0x00, cyan/green/yellow/red gradient, bold red for 0xFF),
@@ -112,16 +118,19 @@ Download from
 ## Usage
 
 ```bash
-# Basic usage — display + forward CAN traffic
+# Basic usage — display CAN traffic on the terminal (no network side effects)
 mcandump can0
+
+# Enable the CANcorder logger: bind TCP + announce via Zeroconf
+mcandump can0 --serve
 
 # Delta timestamps
 mcandump can0 -t delta
 
-# Quiet mode — TCP forwarding only, no terminal output
-mcandump can0 -q
+# Quiet mode — TCP forwarding only, no terminal output (implies --serve use)
+mcandump can0 --serve -q
 
-# Custom Zeroconf service name
+# Custom Zeroconf service name (implies --serve)
 mcandump can0 --service-name "My CAN Logger"
 
 # Disable colors (for piping)
@@ -178,7 +187,8 @@ channel, so slow disk I/O does not block the SocketCAN receive loop.
 | `-q, --quiet` | Suppress terminal display (TCP forwarding only) | off |
 | `--interactive` | Interactive terminal UI with scrollback and search | off |
 | `-f, --log-file [PATH]` | Write a candump-compatible logfile (auto-named if PATH omitted) | off |
-| `--service-name NAME` | Custom Zeroconf service name | auto |
+| `--serve` | Enable the CANcorder logger (TCP server + Zeroconf) | off |
+| `--service-name NAME` | Custom Zeroconf service name (implies `--serve`) | auto |
 
 ### Makefile targets
 
@@ -242,15 +252,17 @@ Each CAN frame is transmitted as a binary packet over TCP:
 
 ```
 Main thread (default pri) : read CAN socket -> push to recorder + display + log channels
-Recorder thread           : recv frames -> pack -> fan out to per-client channels
-Per-client writer threads : drain own channel -> write_all to TCP socket
-Log writer thread         : drain own channel -> write candump-format logfile
+Recorder thread           : recv frames -> pack -> fan out to per-client channels   (only with --serve)
+Per-client writer threads : drain own channel -> write_all to TCP socket            (only with --serve)
+Log writer thread         : drain own channel -> write candump-format logfile       (only with --log-file)
 Display thread (nice +10) : drain channel -> format -> print to stdout
-TCP server thread         : accept connections -> spawn per-client writers
+TCP server thread         : accept connections -> spawn per-client writers          (only with --serve)
 ```
 
 The CAN reader never blocks on slow consumers. Each TCP client has its
-own unbounded queue — a slow client only stalls itself.
+own unbounded queue — a slow client only stalls itself. The recorder,
+TCP server, and Zeroconf registration are only started when `--serve`
+is passed.
 
 ## Permissions
 

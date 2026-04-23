@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-mcandump is a CAN bus logger proxy for Linux, written in Rust. It reads CAN and CAN-FD frames from a SocketCAN interface, displays them on the terminal (like `candump`), and simultaneously forwards them to CANcorder clients via the ECUconnect Logger binary protocol over TCP. It registers itself as a Zeroconf/mDNS service so CANcorder discovers it automatically.
+mcandump is a CAN bus logger proxy for Linux, written in Rust. It reads CAN and CAN-FD frames from a SocketCAN interface and displays them on the terminal (like `candump`). The CANcorder logger side (TCP server + Zeroconf/mDNS advertisement) is opt-in via `--serve`; without that flag the tool has no network side effects and behaves like plain `candump`. When `--serve` is passed it also forwards frames to CANcorder clients via the ECUconnect Logger binary protocol over TCP and registers itself as a Zeroconf/mDNS service so CANcorder discovers it automatically.
 
 ## Build and test
 
@@ -51,7 +51,7 @@ Single-file application: everything is in `src/main.rs`. No modules, no library 
 
 7. **TCP server** — Non-blocking accept loop in a background thread. Each accepted client is registered via `add_client()`, which spawns its per-client writer thread.
 
-8. **Zeroconf** — Uses `mdns-sd` crate. Registers service type `_ecuconnect-log._tcp.local.` with name prefix `ECUconnect-Logger`. TXT records carry system, process, interface, channel metadata. Mandatory — startup fails if registration fails.
+8. **Zeroconf** — Uses `mdns-sd` crate. Registers service type `_ecuconnect-log._tcp.local.` with name prefix `ECUconnect-Logger`. TXT records carry system, process, interface, channel metadata. Only active when `--serve` (or `--service-name`, which implies it) is passed; when active, startup fails hard if registration fails.
 
 9. **Display formatting** — Rich candump-style terminal output. CAN IDs get a stable per-ID color (hash-based palette) so the same ECU always appears in the same hue. Data bytes are heat-mapped by value (dim gray for 0x00, cyan/green/yellow/red gradient, bold red for 0xFF). ASCII column colors printable chars green, non-printable dim.
 

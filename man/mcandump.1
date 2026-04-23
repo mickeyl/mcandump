@@ -1,16 +1,19 @@
-.TH MCANDUMP 1 "April 2026" "mcandump 2.1.0" "User Commands"
+.TH MCANDUMP 1 "April 2026" "mcandump 2.3.0" "User Commands"
 .SH NAME
-mcandump \- SocketCAN dumper and CANcorder logger proxy
+mcandump \- SocketCAN dumper and optional CANcorder logger proxy
 .SH SYNOPSIS
 .B mcandump
 .RI [ OPTIONS ] " <interface>"
 .SH DESCRIPTION
 .B mcandump
-reads CAN and CAN-FD frames from a Linux SocketCAN interface, prints them in a
-candump-like terminal view, and forwards the same traffic to CANcorder clients
-via the ECUconnect Logger protocol over TCP.
+reads CAN and CAN-FD frames from a Linux SocketCAN interface and prints them in
+a candump-like terminal view. With
+.BR --serve ,
+it also forwards the same traffic to CANcorder clients via the ECUconnect
+Logger protocol over TCP and announces the service via Zeroconf/mDNS.
 .PP
-By default it runs in line-oriented output mode. With
+By default it runs in line-oriented output mode with no network side effects.
+With
 .BR --interactive ,
 mcandump switches the terminal into an alternate-screen interactive viewer with
 scrollback, cursor navigation, and search.
@@ -54,8 +57,18 @@ mcandump creates a logfile in the current directory using a candump-style name
 such as
 .BR candump-2026-04-02_154530.log .
 .TP
+.BR \-\-serve
+Enable the CANcorder logger: bind a TCP server on an auto-picked port and
+announce it via Zeroconf so CANcorder clients can discover the logger. Off by
+default — without this flag
+.B mcandump
+behaves like
+.BR candump (1)
+and does not touch the network.
+.TP
 .BI \-\-service-name " <name>"
-Override the advertised Zeroconf service name.
+Override the advertised Zeroconf service name. Implies
+.BR --serve .
 .TP
 .BR \-h ", " \-\-help
 Show command-line help.
@@ -119,7 +132,10 @@ Write a candump-compatible logfile while capturing traffic.
 Write a candump-compatible logfile using an auto-generated candump-style
 filename in the current directory.
 .TP
-.B mcandump can0 -q
+.B mcandump can0 --serve
+Dump to the terminal and also forward traffic to CANcorder clients over TCP.
+.TP
+.B mcandump can0 --serve -q
 Forward traffic to TCP clients without writing frames to the terminal.
 .SH REQUIREMENTS
 mcandump requires Linux with SocketCAN support. Opening the CAN raw socket
