@@ -770,6 +770,23 @@ struct PromptState {
     input: String,
 }
 
+#[derive(Clone, Copy)]
+enum YankFormat {
+    /// Full candump log line: `(sec.us) iface ID#DATA`
+    Candump,
+    /// Compact `ID#DATA` with no timestamp or interface.
+    Hex,
+}
+
+impl YankFormat {
+    fn label(self) -> &'static str {
+        match self {
+            YankFormat::Candump => "candump",
+            YankFormat::Hex => "hex",
+        }
+    }
+}
+
 struct InteractiveState {
     frames: Vec<RxFrame>,
     selected: usize,
@@ -779,6 +796,9 @@ struct InteractiveState {
     prompt: Option<PromptState>,
     /// Tail pane size in rows (0 = not yet initialized, set on first split).
     tail_size: usize,
+    /// When set, a vim-style visual selection is active and the range
+    /// `[min(anchor, selected), max(anchor, selected)]` is highlighted.
+    select_anchor: Option<usize>,
 }
 
 impl InteractiveState {
@@ -788,11 +808,100 @@ impl InteractiveState {
             selected: 0,
             follow_tail: true,
             search: None,
-            status:
-                "Live capture. Use arrows to scroll, / to search bytes, i to search IDs, q to exit."
-                    .to_string(),
+            status: "Live capture. Arrows scroll · / i search · v select · y copy · q quit."
+                .to_string(),
             prompt: None,
             tail_size: 0,
+            select_anchor: None,
+        }
+    }
+
+    /// The inclusive range of selected frames. If no visual-mode anchor is
+    /// set the "range" is just the cursor frame, so `y` always has something
+    /// sensible to copy.
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        if self.frames.is_empty() {
+            return None;
+        }
+        let last = self.frames.len() - 1;
+        let cursor = self.selected.min(last);
+        let anchor = match self.select_anchor {
+            Some(a) => a.min(last),
+            None => return Some((cursor, cursor)),
+        };
+        Some((anchor.min(cursor), anchor.max(cursor)))
+    }
+
+    fn toggle_visual(&mut self) {
+        if self.frames.is_empty() {
+            self.status = "Nothing to select yet.".to_string();
+            return;
+        }
+        if self.select_anchor.take().is_some() {
+            self.status = "Selection cleared.".to_string();
+        } else {
+            self.follow_tail = false;
+            self.select_anchor = Some(self.selected);
+            self.status =
+                "Visual mode · extend with arrows/PgUp/PgDn/n/N · y copy · Y hex · Esc cancel."
+                    .to_string();
+        }
+    }
+
+    fn yank_selection(&mut self, iface: &str, fmt: YankFormat) {
+        let Some((a, b)) = self.selection_range() else {
+            self.status = "Nothing to copy.".to_string();
+            return;
+        };
+        let lines: Vec<String> = (a..=b)
+            .map(|i| match fmt {
+                YankFormat::Candump => format_candump_log_line(&self.frames[i], iface),
+                YankFormat::Hex => format_candump_frame(&self.frames[i]),
+            })
+            .collect();
+        self.deliver_yank(&lines, fmt, "Copied");
+        self.select_anchor = None;
+    }
+
+    fn yank_all_matches(&mut self, iface: &str, fmt: YankFormat) {
+        let Some(search) = self.search.clone() else {
+            self.status = "No active search — press / or i first.".to_string();
+            return;
+        };
+        let lines: Vec<String> = self
+            .frames
+            .iter()
+            .filter(|frame| frame_matches(frame, &search))
+            .map(|frame| match fmt {
+                YankFormat::Candump => format_candump_log_line(frame, iface),
+                YankFormat::Hex => format_candump_frame(frame),
+            })
+            .collect();
+        if lines.is_empty() {
+            self.status = format!("No matches for {} to copy.", search.label());
+            return;
+        }
+        self.deliver_yank(&lines, fmt, "Copied matches for");
+    }
+
+    fn deliver_yank(&mut self, lines: &[String], fmt: YankFormat, prefix: &str) {
+        let text: String = lines
+            .iter()
+            .flat_map(|line| [line.as_str(), "\n"])
+            .collect();
+        let count = lines.len();
+        let bytes = text.len();
+        match copy_to_clipboard_osc52(&text) {
+            Ok(()) => {
+                self.status = format!(
+                    "{prefix} {count} frame{plural} ({bytes} bytes, {fmt_label}) → clipboard (OSC 52).",
+                    plural = if count == 1 { "" } else { "s" },
+                    fmt_label = fmt.label(),
+                );
+            }
+            Err(err) => {
+                self.status = format!("Clipboard copy failed: {err}");
+            }
         }
     }
 
@@ -909,7 +1018,14 @@ impl InteractiveState {
         false
     }
 
-    fn handle_key(&mut self, key: KeyEvent, page_rows: usize, body_rows: usize, stop: &AtomicBool) {
+    fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        page_rows: usize,
+        body_rows: usize,
+        iface: &str,
+        stop: &AtomicBool,
+    ) {
         if let Some(prompt) = self.prompt.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -949,6 +1065,15 @@ impl InteractiveState {
             KeyCode::Char('i') => self.start_prompt(PromptKind::ArbitrationId),
             KeyCode::Char('n') => self.repeat_search(true),
             KeyCode::Char('N') => self.repeat_search(false),
+            KeyCode::Char('v') => self.toggle_visual(),
+            KeyCode::Char('y') => self.yank_selection(iface, YankFormat::Candump),
+            KeyCode::Char('Y') => self.yank_selection(iface, YankFormat::Hex),
+            KeyCode::Char('V') => self.yank_all_matches(iface, YankFormat::Candump),
+            KeyCode::Esc => {
+                if self.select_anchor.take().is_some() {
+                    self.status = "Selection cancelled.".to_string();
+                }
+            }
             KeyCode::Char('q') => {
                 self.status = "Exiting interactive mode...".to_string();
                 stop.store(true, Ordering::SeqCst);
@@ -968,15 +1093,25 @@ impl InteractiveState {
         } else {
             format!("{}/{}", self.selected + 1, frames)
         };
-        let mode = if self.follow_tail { "live" } else { "paused" };
+        let mode = if self.select_anchor.is_some() {
+            "visual"
+        } else if self.follow_tail {
+            "live"
+        } else {
+            "paused"
+        };
+        let selection = match (self.select_anchor, self.selection_range()) {
+            (Some(_), Some((a, b))) => format!("  sel: {}", b - a + 1),
+            _ => String::new(),
+        };
         let search = self
             .search
             .as_ref()
             .map(|search| format!("  search: {}", search.label()))
             .unwrap_or_default();
         format!(
-            "{}  pos: {}  mode: {}{}",
-            self.status, position, mode, search
+            "{}  pos: {}  mode: {}{}{}",
+            self.status, position, mode, selection, search
         )
     }
 }
@@ -1068,7 +1203,7 @@ fn run_interactive_display(
                     };
                     let sep_rows = if tail_rows > 0 { 1 } else { 0 };
                     let page_rows = body_rows - tail_rows - sep_rows;
-                    state.handle_key(key, page_rows, body_rows, &stop);
+                    state.handle_key(key, page_rows, body_rows, &iface, &stop);
                     needs_redraw = true;
                 }
                 Ok(Event::Resize(_, _)) => needs_redraw = true,
@@ -1141,6 +1276,8 @@ fn draw_interactive(
 
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
 
+    let selection_range = state.selection_range();
+
     // ── Main pane (scrollable, colored) ──────────────────────────────────
     for row in 0..main_rows {
         let idx = top + row;
@@ -1150,8 +1287,17 @@ fn draw_interactive(
                 .checked_sub(1)
                 .and_then(|prev_idx| state.frames.get(prev_idx))
                 .map(|frame| frame.timestamp_us);
-            let prefix = if idx == selected { '>' } else { ' ' };
-            if idx == selected {
+            let is_cursor = idx == selected;
+            let in_selection = state.select_anchor.is_some()
+                && selection_range.is_some_and(|(a, b)| idx >= a && idx <= b);
+            let prefix = if is_cursor {
+                '>'
+            } else if in_selection {
+                '*'
+            } else {
+                ' '
+            };
+            if is_cursor || in_selection {
                 // Plain text + reverse video — no ANSI codes to interfere
                 let line = format!(
                     "{prefix}{}",
@@ -1165,12 +1311,13 @@ fn draw_interactive(
                 );
                 let padded = format!("{line:<width$}", width = cols as usize);
                 let truncated = truncate_to_width(&padded, cols as usize);
-                queue!(
-                    stdout,
-                    SetAttribute(Attribute::Reverse),
-                    Print(truncated),
-                    SetAttribute(Attribute::Reset)
-                )?;
+                queue!(stdout, SetAttribute(Attribute::Reverse))?;
+                if is_cursor && state.select_anchor.is_some() {
+                    // The cursor within a visual range gets an extra bold hint
+                    // so users can always see where the anchor-moving end is.
+                    queue!(stdout, SetAttribute(Attribute::Bold))?;
+                }
+                queue!(stdout, Print(truncated), SetAttribute(Attribute::Reset))?;
             } else {
                 let line = format!(
                     "{prefix}{}",
@@ -1227,7 +1374,8 @@ fn draw_interactive(
     }
 
     // ── Help bar ─────────────────────────────────────────────────────────
-    let help = "/ bytes  i ID  n/N next/prev  arrows scroll  S-arrows split  PgUp/PgDn page  Home/End  q quit";
+    let help =
+        "/ bytes  i ID  n/N next  v sel  y copy  Y hex  V all-matches  arrows scroll  q quit";
     queue!(
         stdout,
         MoveTo(0, help_row),
@@ -1345,6 +1493,47 @@ fn truncate_to_width(text: &str, width: usize) -> String {
         return String::new();
     }
     text.chars().take(width).collect()
+}
+
+// ── Clipboard via OSC 52 ──────────────────────────────────────────────────
+//
+// OSC 52 (\x1b]52;c;<base64>\x07) asks the terminal emulator to put the
+// decoded payload into the system clipboard.  Works across kitty, WezTerm,
+// Alacritty, iTerm2, modern gnome-terminal, and tmux (when configured with
+// `set -g set-clipboard on`), including over SSH.  Terminals that don't
+// implement OSC 52 silently drop the sequence.
+
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(BASE64_ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(BASE64_ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        if chunk.len() >= 2 {
+            out.push(BASE64_ALPHABET[((n >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() >= 3 {
+            out.push(BASE64_ALPHABET[(n & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn copy_to_clipboard_osc52(payload: &str) -> io::Result<()> {
+    let encoded = base64_encode(payload.as_bytes());
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()
 }
 
 // ── TCP server ────────────────────────────────────────────────────────────
@@ -2159,6 +2348,37 @@ mod tests {
         let frame = sample_frame(0x456, &[0x00]);
         assert!(frame_matches(&frame, &SearchQuery::ArbitrationId(0x456)));
         assert!(!frame_matches(&frame, &SearchQuery::ArbitrationId(0x123)));
+    }
+
+    #[test]
+    fn base64_encode_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn selection_range_cursor_only_without_anchor() {
+        let mut state = InteractiveState::new();
+        state.frames.push(sample_frame(0x100, &[0x00]));
+        state.frames.push(sample_frame(0x200, &[0x00]));
+        state.selected = 1;
+        assert_eq!(state.selection_range(), Some((1, 1)));
+    }
+
+    #[test]
+    fn selection_range_spans_anchor_to_cursor() {
+        let mut state = InteractiveState::new();
+        for id in [0x100, 0x200, 0x300, 0x400] {
+            state.frames.push(sample_frame(id, &[0x00]));
+        }
+        state.select_anchor = Some(3);
+        state.selected = 1;
+        assert_eq!(state.selection_range(), Some((1, 3)));
     }
 
     #[test]

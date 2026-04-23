@@ -61,7 +61,10 @@ can drop frames under high bus load.
   keeps the display readable without visual noise. A live tail pane
   appears automatically when you scroll away from the latest frames,
   so you never lose sight of current traffic — resize it on the fly
-  with `Shift+↑`/`Shift+↓`
+  with `Shift+↑`/`Shift+↓`. Vim-style visual selection (`v` + nav +
+  `y`) copies arbitrary ranges of frames straight to the system
+  clipboard via OSC 52 — no `xclip`/`wl-copy`/`pbcopy` needed, works
+  over SSH
 - **Candump-compatible logfile output** — optional background writer
   thread emits the compact `candump` text log format for later replay or
   import into other tools
@@ -156,8 +159,20 @@ mcandump can0 --log-file
 - `/` — find a byte sequence, e.g. `DE AD BE EF` or `deadbeef`
 - `i` — find an arbitration ID in hex, e.g. `123` or `0x18FF50E5`
 - `n` / `N` — jump to next / previous match
+- `v` — start / stop a vim-style visual selection (extend it with any
+  navigation key — arrows, `PgUp`/`PgDn`, `Home`/`End`, `n`/`N`)
+- `y` — yank: copy the current visual selection (or just the cursor
+  frame) to the system clipboard as candump log lines
+- `Y` — yank as compact hex-only (`ID#DATA`, no timestamp or interface)
+- `V` — yank every frame that matches the active search
 - `q` — exit `mcandump`
-- `Esc` — cancel the current search prompt
+- `Esc` — cancel the current search prompt, or the active selection
+
+The clipboard copy uses the terminal's **OSC 52** escape sequence, so
+it needs no external helper (`xclip`, `wl-copy`, `pbcopy`, …) and works
+over SSH too. Any modern terminal supports it (kitty, WezTerm,
+Alacritty, iTerm2, recent gnome-terminal). Inside `tmux`, enable
+passthrough with `set -g set-clipboard on`.
 
 In interactive mode the capture buffer grows without an internal limit;
 it is only bounded by the process memory available on the host.

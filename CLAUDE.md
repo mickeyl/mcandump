@@ -55,6 +55,8 @@ Single-file application: everything is in `src/main.rs`. No modules, no library 
 
 9. **Display formatting** — Rich candump-style terminal output. CAN IDs get a stable per-ID color (hash-based palette) so the same ECU always appears in the same hue. Data bytes are heat-mapped by value (dim gray for 0x00, cyan/green/yellow/red gradient, bold red for 0xFF). ASCII column colors printable chars green, non-printable dim.
 
+    Interactive mode adds a vim-style visual selection (`select_anchor: Option<usize>`): pressing `v` drops the anchor at the cursor, and every existing navigation key extends the highlighted range. `y` yanks the range as candump log lines, `Y` as compact `ID#DATA`, `V` yanks every frame matching the current search. The clipboard transport is an OSC 52 escape sequence (`\x1b]52;c;<base64>\x07`) written straight to stdout — no external tool needed, works over SSH. Base64 is hand-rolled (~25 lines) to keep the dependency count low.
+
 10. **Signal handling** — Global `OnceLock<Arc<AtomicBool>>` + libc signal handler for clean SIGINT/SIGTERM shutdown. SO_RCVTIMEO on the CAN socket ensures the read loop checks the stop flag every 500ms.
 
 11. **main()** — Opens CAN socket, binds TCP, installs signals, starts server/recorder/display threads, starts zeroconf. The main loop only reads CAN frames and pushes to unbounded channels — it never touches TCP or stdout.

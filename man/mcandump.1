@@ -1,4 +1,4 @@
-.TH MCANDUMP 1 "April 2026" "mcandump 2.3.0" "User Commands"
+.TH MCANDUMP 1 "April 2026" "mcandump 2.4.0" "User Commands"
 .SH NAME
 mcandump \- SocketCAN dumper and optional CANcorder logger proxy
 .SH SYNOPSIS
@@ -107,8 +107,39 @@ Search for an arbitration ID in hexadecimal, for example
 .B n / N
 Jump to the next or previous search result.
 .TP
+.B v
+Start or stop a vim-style visual selection. While visual mode is active every
+navigation key (arrows,
+.BR PgUp / PgDn ,
+.BR Home / End ,
+.BR n / N )
+extends the highlighted range.
+.TP
+.B y
+Yank: copy the current visual selection (or just the cursor frame, if no
+selection is active) to the system clipboard as candump log lines
+.RI ( (sec.us)\  iface\  ID#DATA ).
+The transfer uses the terminal's OSC 52 escape sequence, so no external helper
+.RB ( xclip ", " wl-copy ", " pbcopy )
+is required and the copy works over SSH. Inside
+.BR tmux ,
+enable passthrough with
+.BR "set -g set-clipboard on" .
+.TP
+.B Y
+Yank as compact hex-only
+.RB ( ID#DATA ,
+no timestamp or interface).
+.TP
+.B V
+Yank every frame matching the currently active search — useful after narrowing
+down with
+.BR /
+or
+.BR i .
+.TP
 .B Esc
-Cancel the active search prompt.
+Cancel the active search prompt or the active visual selection.
 .TP
 .B q
 Exit mcandump.
@@ -123,7 +154,7 @@ using the default absolute timestamps.
 Display inter-frame delta timestamps.
 .TP
 .B mcandump can0 --interactive
-Start the interactive viewer with scrollback and search.
+Start the interactive viewer with scrollback, search, and clipboard yank.
 .TP
 .B mcandump can0 --log-file capture.log
 Write a candump-compatible logfile while capturing traffic.
