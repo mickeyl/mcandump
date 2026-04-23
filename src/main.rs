@@ -115,11 +115,14 @@ enum Theme {
     Dark,
 }
 
-/// mcandump — Mickey's CAN dump + CANcorder logger proxy
+/// Enhanced candump for SocketCAN — rich colors, interactive scrollback/search,
+/// auto theme detection. Optional CANcorder logger.
 ///
-/// Reads CAN/CAN-FD frames from a SocketCAN interface, displays them on the
-/// terminal (like candump), and simultaneously forwards them to CANcorder
-/// clients via the ECUconnect Logger binary protocol over TCP.
+/// Reads CAN/CAN-FD frames from a SocketCAN interface and displays them with
+/// stable per-ID colors, heat-mapped data bytes, and an interactive alternate-
+/// screen viewer with scrollback, search, and visual-mode clipboard yank.
+/// Pass --serve to also forward traffic to CANcorder clients via the
+/// ECUconnect Logger binary protocol over TCP.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {

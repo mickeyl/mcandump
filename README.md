@@ -11,32 +11,45 @@
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-blue)
 ![Rust](https://img.shields.io/badge/language-Rust-orange)
 
-CAN bus logger proxy for Linux, built in Rust. Reads CAN and CAN-FD
-frames from a SocketCAN interface and displays them on the terminal
-(like `candump`). Add `--serve` to turn it into a CANcorder logger that
-also forwards traffic to
+An enhanced `candump` for SocketCAN, built in Rust. Reads CAN and CAN-FD
+frames and displays them on the terminal with rich color coding, an
+interactive alternate-screen viewer with scrollback, search and
+clipboard yank, and auto light/dark theme detection. Pass `--serve` to
+additionally forward traffic to
 [CANcorder](https://apps.apple.com/app/cancorder/id6743640770) clients
 via the ECUconnect Logger binary protocol over TCP, announced via
 Zeroconf/mDNS.
 
 ## Why?
 
-If you work with CAN bus traffic and want to view it in real time on
-your Mac or iPad using CANcorder, you need something that bridges a
-Linux SocketCAN interface to the CANcorder logging system. The existing
-Python-based logger proxies work, but they add latency, eat CPU, and
-can drop frames under high bus load.
+`candump` from `can-utils` does the job, but its display hasn't moved
+on much: every frame looks the same in an ever-scrolling stream, CAN-FD
+payloads get no more screen than classic 8-byte ones, colors are
+minimal, and the only way to look at earlier traffic is to redirect
+output to a file and read it later.
 
-**mcandump** is a single-binary Rust replacement that:
+**mcandump** keeps candump's line format — so existing replay scripts
+and log parsers still work — and adds the things you actually want
+when you're staring at bus traffic:
 
-- Reads CAN and CAN-FD frames with zero-copy SocketCAN FFI
-- Never drops frames — each TCP client gets a dedicated writer thread
-  with an unbounded buffer, so a slow client only backs up its own
-  queue
-- Registers itself via Zeroconf/mDNS so CANcorder discovers it
-  automatically
-- Displays frames on the terminal with rich color coding — per-ID
-  stable colors, heat-mapped data bytes, and aligned ASCII output
+- **Stable per-ID colors** so the same ECU is always the same hue
+- **Heat-mapped data bytes** so the shape of a payload jumps off the
+  screen, with a separate coloring for printable vs non-printable
+  ASCII
+- **Light/dark theme aware** — auto-detects the terminal background
+  via OSC 11 (with a `COLORFGBG` fallback) and picks a palette that
+  actually reads on paper-colored terminal schemes
+- **Interactive alternate-screen viewer** with unbounded scrollback,
+  search by payload bytes or arbitration ID, vim-style visual
+  selection, and OSC 52 clipboard yank that works over SSH
+- **A live tail pane** that keeps the newest traffic visible while
+  you investigate older frames
+
+As a bonus, pass `--serve` and mcandump becomes a CANcorder logger as
+well — a single-binary Rust replacement for the older Python-based
+proxies, with zero-copy SocketCAN reads, per-client unbounded buffers
+(a slow client only backs up its own queue, never drops frames), and
+Zeroconf/mDNS auto-discovery.
 
 ## Features
 
