@@ -34,6 +34,21 @@ Timestamp display mode. The default is
 .BR \-\-no-color
 Disable colored output.
 .TP
+.BR \-\-theme " <auto|light|dark>"
+Select the color palette.
+.BR auto
+(default) queries the terminal background color via OSC 11, falling back
+to the
+.B COLORFGBG
+environment variable; it then picks the light palette for paper-colored
+backgrounds and the dark palette otherwise.
+.BR light
+and
+.BR dark
+force the corresponding palette explicitly — useful over SSH or inside
+multiplexers that swallow the OSC query, or when auto-detection picks
+the wrong one.
+.TP
 .BR \-q ", " \-\-quiet
 Suppress terminal frame display and only forward traffic over TCP.
 .TP

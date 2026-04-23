@@ -105,6 +105,16 @@ enum TimestampMode {
     None,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Theme {
+    /// Auto-detect from terminal background color (OSC 11, then COLORFGBG)
+    Auto,
+    /// Force the light-background palette
+    Light,
+    /// Force the dark-background palette
+    Dark,
+}
+
 /// mcandump — Mickey's CAN dump + CANcorder logger proxy
 ///
 /// Reads CAN/CAN-FD frames from a SocketCAN interface, displays them on the
@@ -123,6 +133,10 @@ struct Cli {
     /// Disable colored terminal output
     #[arg(long)]
     no_color: bool,
+
+    /// Theme for the color palette: auto (query terminal), light, or dark
+    #[arg(long, value_enum, default_value_t = Theme::Auto)]
+    theme: Theme,
 
     /// Suppress terminal frame display (TCP forwarding only)
     #[arg(short = 'q', long)]
@@ -149,15 +163,140 @@ struct Cli {
     service_name: Option<String>,
 }
 
+// ── Theme detection ───────────────────────────────────────────────────────
+
+/// Detect whether the terminal has a light background.  Returns `Some(true)`
+/// for light, `Some(false)` for dark, or `None` if we can't tell.
+///
+/// First tries OSC 11 (`ESC ] 11 ; ? ESC \\` — the terminal answers with its
+/// background color).  Falls back to parsing `$COLORFGBG` (older xterm-family
+/// convention).  Returns `None` when neither is available; the caller picks a
+/// default.
+fn detect_is_light_theme() -> Option<bool> {
+    if let Some(rgb) = query_bg_via_osc11() {
+        return Some(is_light_rgb(rgb));
+    }
+    detect_via_colorfgbg()
+}
+
+fn is_light_rgb((r, g, b): (u8, u8, u8)) -> bool {
+    let lum = 0.2126 * (r as f32 / 255.0)
+        + 0.7152 * (g as f32 / 255.0)
+        + 0.0722 * (b as f32 / 255.0);
+    lum > 0.5
+}
+
+fn detect_via_colorfgbg() -> Option<bool> {
+    let val = std::env::var("COLORFGBG").ok()?;
+    // Format is "fg;bg" or "fg;default;bg" — take the last ';'-separated token.
+    let bg: u32 = val.rsplit(';').next()?.parse().ok()?;
+    // ANSI indices 0–6 are the dark half of the 16-color table, 7–15 the light.
+    Some(bg >= 7)
+}
+
+fn query_bg_via_osc11() -> Option<(u8, u8, u8)> {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let stdin_fd = stdin.as_raw_fd();
+    let stdout_fd = stdout.as_raw_fd();
+    if unsafe { libc::isatty(stdin_fd) } == 0 || unsafe { libc::isatty(stdout_fd) } == 0 {
+        return None;
+    }
+
+    let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(stdin_fd, &mut orig) } != 0 {
+        return None;
+    }
+    let mut raw = orig;
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    raw.c_cc[libc::VMIN] = 0;
+    raw.c_cc[libc::VTIME] = 2; // 200 ms per read
+    if unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &raw) } != 0 {
+        return None;
+    }
+
+    // Restore termios on any exit path.
+    struct RestoreTermios {
+        fd: i32,
+        orig: libc::termios,
+    }
+    impl Drop for RestoreTermios {
+        fn drop(&mut self) {
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
+        }
+    }
+    let _restore = RestoreTermios { fd: stdin_fd, orig };
+
+    {
+        let mut out = stdout.lock();
+        out.write_all(b"\x1b]11;?\x07").ok()?;
+        out.flush().ok()?;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut buf = Vec::with_capacity(64);
+    let mut stdin = stdin.lock();
+    while Instant::now() < deadline {
+        let mut chunk = [0u8; 32];
+        match stdin.read(&mut chunk) {
+            Ok(0) => continue,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                // Response ends with BEL (0x07) or ST (ESC \\).
+                if buf.contains(&0x07) || buf.windows(2).any(|w| w == [0x1b, b'\\']) {
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    parse_osc11_response(&buf)
+}
+
+fn parse_osc11_response(buf: &[u8]) -> Option<(u8, u8, u8)> {
+    let s = std::str::from_utf8(buf).ok()?;
+    let payload_start = s.find("rgb:")? + 4;
+    let rest = &s[payload_start..];
+    let end = rest.find(['\x07', '\x1b']).unwrap_or(rest.len());
+    let mut parts = rest[..end].split('/');
+    let r = parse_osc11_channel(parts.next()?)?;
+    let g = parse_osc11_channel(parts.next()?)?;
+    let b = parse_osc11_channel(parts.next()?)?;
+    Some((r, g, b))
+}
+
+fn parse_osc11_channel(s: &str) -> Option<u8> {
+    let hex: String = s.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    if hex.is_empty() {
+        return None;
+    }
+    let v = u32::from_str_radix(&hex, 16).ok()?;
+    // Terminals return 8-bit (RR), 12-bit (RRR), or 16-bit (RRRR) channels.
+    let scaled = match hex.len() {
+        1 => v * 0x11,
+        2 => v,
+        3 => v >> 4,
+        4 => v >> 8,
+        _ => v >> ((hex.len() - 2) * 4),
+    };
+    Some(scaled.min(255) as u8)
+}
+
 // ── ANSI color helpers ────────────────────────────────────────────────────
 
 struct Colors {
     enabled: bool,
+    is_light: bool,
 }
 
 impl Colors {
-    fn new(enabled: bool) -> Self {
-        Self { enabled }
+    fn new(enabled: bool, is_light: bool) -> Self {
+        Self { enabled, is_light }
     }
 
     fn paint(&self, text: &str, code: &str) -> String {
@@ -174,49 +313,61 @@ impl Colors {
 
     /// Pick a stable color for a CAN ID so the same ECU always appears in the
     /// same hue — makes it easy to visually track individual senders in scrolling
-    /// traffic.  The palette avoids red (reserved for 0xFF data bytes) and dim
-    /// gray (reserved for 0x00).
-    fn id_color(can_id: u32) -> &'static str {
-        const PALETTE: &[&str] = &[
-            "1;36", // bold cyan
-            "1;32", // bold green
-            "1;33", // bold yellow
-            "1;35", // bold magenta
-            "1;34", // bold blue
-            "36",   // cyan
-            "32",   // green
-            "33",   // yellow
-            "35",   // magenta
-            "34",   // blue
+    /// traffic.  Palette avoids red (reserved for 0xFF data bytes) and dim gray
+    /// (reserved for 0x00).  A theme-specific variant replaces bright cyan /
+    /// yellow / green on light backgrounds, where those hues clash with
+    /// paper-colored terminal schemes.
+    fn id_color(&self, can_id: u32) -> &'static str {
+        const PALETTE_DARK: &[&str] = &[
+            "1;36", "1;32", "1;33", "1;35", "1;34",
+            "36",   "32",   "33",   "35",   "34",
         ];
-        // Simple hash: multiply by a prime, take modulo palette length.
-        let idx = ((can_id as u64).wrapping_mul(2654435761) % PALETTE.len() as u64) as usize;
-        PALETTE[idx]
+        const PALETTE_LIGHT: &[&str] = &[
+            "38;5;18",  // DarkBlue
+            "38;5;22",  // DarkGreen
+            "38;5;90",  // DarkMagenta
+            "38;5;130", // DarkOrange3
+            "38;5;24",  // DeepSkyBlue4a
+            "38;5;94",  // Orange4 (brown)
+            "38;5;54",  // Purple4a
+            "38;5;23",  // DarkCyan
+            "38;5;58",  // Yellow4 (olive)
+            "38;5;26",  // DeepSkyBlue4c
+        ];
+        let palette = if self.is_light { PALETTE_LIGHT } else { PALETTE_DARK };
+        let idx = ((can_id as u64).wrapping_mul(2654435761) % palette.len() as u64) as usize;
+        palette[idx]
     }
 
-    /// Color a data byte by value — a heat-map that makes patterns jump out:
-    ///   0x00        dim gray       (null bytes are "cold")
-    ///   0x01–0x1F   dark cyan      (low / control range)
-    ///   0x20–0x7E   green          (printable ASCII range)
-    ///   0x7F–0xBF   yellow         (upper half)
-    ///   0xC0–0xFE   light red      (high range)
-    ///   0xFF        bold bright red (saturated)
+    /// Color a data byte by value — a heat-map that makes patterns jump out.
+    /// The light-theme palette uses saturated dark 256-color indices so the
+    /// gradient stays legible on paper-colored backgrounds.
     fn data_byte(&self, b: u8) -> String {
         if !self.enabled {
             return format!("{b:02X}");
         }
-        let code = match b {
-            0x00 => "2;37",      // dim white (gray)
-            0x01..=0x1F => "36", // cyan
-            0x20..=0x7E => "32", // green
-            0x7F..=0xBF => "33", // yellow
-            0xC0..=0xFE => "31", // red
-            0xFF => "1;31",      // bold red
+        let code = if self.is_light {
+            match b {
+                0x00 => "38;5;246",        // grey58
+                0x01..=0x1F => "38;5;24",  // DeepSkyBlue4a
+                0x20..=0x7E => "38;5;22",  // DarkGreen
+                0x7F..=0xBF => "38;5;130", // DarkOrange3
+                0xC0..=0xFE => "38;5;88",  // DarkRed
+                0xFF => "1;38;5;124",      // bold Red3a
+            }
+        } else {
+            match b {
+                0x00 => "2;37",      // dim white (gray)
+                0x01..=0x1F => "36", // cyan
+                0x20..=0x7E => "32", // green
+                0x7F..=0xBF => "33", // yellow
+                0xC0..=0xFE => "31", // red
+                0xFF => "1;31",      // bold red
+            }
         };
         format!("\x1b[{code}m{b:02X}\x1b[0m")
     }
 
-    /// Color an ASCII character: printable → green, non-printable dot → dim.
     fn ascii_char(&self, b: u8) -> String {
         if !self.enabled {
             let ch = if b.is_ascii_graphic() || b == b' ' {
@@ -227,10 +378,38 @@ impl Colors {
             return format!("{ch}");
         }
         if b.is_ascii_graphic() || b == b' ' {
-            format!("\x1b[32m{}\x1b[0m", b as char)
+            format!("\x1b[{}m{}\x1b[0m", self.ascii_printable_code(), b as char)
         } else {
-            "\x1b[2;37m.\x1b[0m".to_string()
+            format!("\x1b[{}m.\x1b[0m", self.ascii_nonprintable_code())
         }
+    }
+
+    // Theme-aware SGR code snippets for callers that write escape sequences
+    // directly (format_frame_interactive, format_frame).  Dark-theme variants
+    // use the `2` (faint) attribute, which WezTerm and friends render by
+    // blending the foreground toward the background — unreadable on paper-
+    // colored themes, so the light variants use explicit 256-color grays /
+    // dark hues instead.
+    fn dim_code(&self) -> &'static str {
+        if self.is_light { "38;5;244" } else { "2" }
+    }
+    fn iface_code(&self) -> &'static str {
+        if self.is_light { "38;5;24" } else { "2;34" }
+    }
+    fn fd_code(&self) -> &'static str {
+        if self.is_light { "38;5;91" } else { "2;35" }
+    }
+    fn data_interactive_code(&self) -> &'static str {
+        if self.is_light { "38;5;24" } else { "36" }
+    }
+    fn ascii_printable_code(&self) -> &'static str {
+        if self.is_light { "38;5;22" } else { "32" }
+    }
+    fn ascii_nonprintable_code(&self) -> &'static str {
+        if self.is_light { "38;5;248" } else { "2;37" }
+    }
+    fn dlc_code(&self) -> &'static str {
+        if self.is_light { "38;5;244" } else { "38;5;245" }
     }
 }
 
@@ -1143,7 +1322,7 @@ fn run_interactive_display(
     rx: mpsc::Receiver<RxFrame>,
     iface: String,
     ts_mode: TimestampMode,
-    fallback_colors: Colors,
+    colors: Colors,
     stop: Arc<AtomicBool>,
 ) {
     unsafe {
@@ -1154,7 +1333,7 @@ fn run_interactive_display(
         Ok(terminal) => terminal,
         Err(err) => {
             eprintln!("warning: interactive mode unavailable: {err}");
-            run_display(rx, iface, ts_mode, fallback_colors);
+            run_display(rx, iface, ts_mode, colors);
             return;
         }
     };
@@ -1176,7 +1355,9 @@ fn run_interactive_display(
         }
 
         if needs_redraw {
-            if let Err(err) = draw_interactive(&mut terminal.stdout, &mut state, &iface, ts_mode) {
+            if let Err(err) =
+                draw_interactive(&mut terminal.stdout, &mut state, &iface, ts_mode, &colors)
+            {
                 state.status = format!("render error: {err}");
             } else {
                 needs_redraw = false;
@@ -1229,9 +1410,10 @@ fn draw_interactive(
     state: &mut InteractiveState,
     iface: &str,
     ts_mode: TimestampMode,
+    colors: &Colors,
 ) -> io::Result<()> {
     let (cols, rows) = terminal::size()?;
-    let plain = Colors::new(false);
+    let plain = Colors::new(false, false);
 
     // Fixed chrome: help bar + status bar = 2 rows.
     // When scrolled away, add a separator + tail pane (~20% of body).
@@ -1326,6 +1508,7 @@ fn draw_interactive(
                         iface,
                         ts_mode,
                         previous_timestamp_us,
+                        colors,
                     )
                 );
                 let truncated = truncate_to_visible_width(&line, cols as usize);
@@ -1365,6 +1548,7 @@ fn draw_interactive(
                         iface,
                         ts_mode,
                         previous_timestamp_us,
+                        colors,
                     )
                 );
                 let truncated = truncate_to_visible_width(&line, cols as usize);
@@ -1720,14 +1904,17 @@ fn format_frame_interactive(
     iface: &str,
     ts_mode: TimestampMode,
     previous_timestamp_us: Option<u64>,
+    colors: &Colors,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(512);
 
+    let dim = colors.dim_code();
+
     // Timestamp — dim, no brackets
     match ts_mode {
         TimestampMode::Absolute => {
-            let _ = write!(out, "\x1b[2m{} ", timestamp_from_us(frame.timestamp_us));
+            let _ = write!(out, "\x1b[{dim}m{} ", timestamp_from_us(frame.timestamp_us));
         }
         TimestampMode::Delta => {
             let delta_us = frame
@@ -1736,7 +1923,7 @@ fn format_frame_interactive(
             let delta = Duration::from_micros(delta_us);
             let _ = write!(
                 out,
-                "\x1b[2m{:6}.{:06} ",
+                "\x1b[{dim}m{:6}.{:06} ",
                 delta.as_secs(),
                 delta.subsec_micros()
             );
@@ -1744,20 +1931,20 @@ fn format_frame_interactive(
         TimestampMode::None => {}
     }
 
-    // Interface — dim blue (switch directly from dim)
-    let _ = write!(out, "\x1b[2;34m{iface:>8}\x1b[0m  ");
+    // Interface
+    let _ = write!(out, "\x1b[{}m{iface:>8}\x1b[0m  ", colors.iface_code());
 
     // CAN ID — stable per-ID color
-    let id_code = Colors::id_color(frame.can_id);
+    let id_code = colors.id_color(frame.can_id);
     if frame.is_extended {
         let _ = write!(out, "\x1b[{id_code}m{:08X}", frame.can_id);
     } else {
         let _ = write!(out, "\x1b[{id_code}m{:>8X}", frame.can_id);
     }
 
-    // FD indicator — dim magenta
+    // FD indicator
     if frame.is_fd {
-        out.push_str("\x1b[2;35m  ##");
+        let _ = write!(out, "\x1b[{}m  ##", colors.fd_code());
         if frame.brs {
             out.push('B');
         }
@@ -1767,11 +1954,11 @@ fn format_frame_interactive(
     }
 
     // DLC — dim
-    let _ = write!(out, "\x1b[2m  [{:2}]  ", frame.len);
+    let _ = write!(out, "\x1b[{dim}m  [{:2}]  ", frame.len);
 
-    // Data bytes — all in one muted cyan
+    // Data bytes — uniform muted color
     let max_bytes: usize = if frame.is_fd { 64 } else { 8 };
-    out.push_str("\x1b[36m");
+    let _ = write!(out, "\x1b[{}m", colors.data_interactive_code());
     for (i, &b) in frame.data[..frame.len].iter().enumerate() {
         if i > 0 {
             out.push(' ');
@@ -1784,8 +1971,8 @@ fn format_frame_interactive(
         out.push_str("   ");
     }
 
-    // ASCII — green
-    out.push_str("  \x1b[32m'");
+    // ASCII
+    let _ = write!(out, "  \x1b[{}m'", colors.ascii_printable_code());
     for &b in &frame.data[..frame.len] {
         if b.is_ascii_graphic() || b == b' ' {
             out.push(b as char);
@@ -1845,11 +2032,13 @@ fn format_frame(
 ) -> String {
     let mut out = String::with_capacity(512);
 
+    let dim = colors.dim_code();
+
     // Timestamp
     match ts_mode {
         TimestampMode::Absolute => {
             out.push_str(
-                &colors.paint(&format!("{} ", timestamp_from_us(frame.timestamp_us)), "2"),
+                &colors.paint(&format!("{} ", timestamp_from_us(frame.timestamp_us)), dim),
             );
         }
         TimestampMode::Delta => {
@@ -1859,18 +2048,18 @@ fn format_frame(
             let delta = Duration::from_micros(delta_us);
             out.push_str(&colors.paint(
                 &format!("{:6}.{:06} ", delta.as_secs(), delta.subsec_micros()),
-                "2",
+                dim,
             ));
         }
         TimestampMode::None => {}
     }
 
     // Interface
-    out.push_str(&colors.paint(&format!("{iface:>8}"), "1;34"));
+    out.push_str(&colors.paint(&format!("{iface:>8}"), colors.iface_code()));
     out.push_str("  ");
 
     // CAN ID — always 8 chars wide (padded), stable per-ID color
-    let id_code = Colors::id_color(frame.can_id);
+    let id_code = colors.id_color(frame.can_id);
     let id_str = if frame.is_extended {
         format!("{:08X}", frame.can_id)
     } else {
@@ -1887,12 +2076,12 @@ fn format_frame(
         if frame.esi {
             tag.push('E');
         }
-        out.push_str(&colors.paint(&tag, "1;35"));
+        out.push_str(&colors.paint(&tag, colors.fd_code()));
     }
 
-    // DLC — middle gray
+    // DLC
     out.push_str("  ");
-    out.push_str(&colors.paint(&format!("[{:2}]", frame.len), "38;5;245"));
+    out.push_str(&colors.paint(&format!("[{:2}]", frame.len), colors.dlc_code()));
     out.push_str("  ");
 
     // Data bytes — heat-mapped by value, padded to max 64 bytes width
@@ -1911,11 +2100,11 @@ fn format_frame(
 
     // ASCII representation
     out.push_str("  ");
-    out.push_str(&colors.paint("'", "2"));
+    out.push_str(&colors.paint("'", dim));
     for &b in &frame.data[..frame.len] {
         out.push_str(&colors.ascii_char(b));
     }
-    out.push_str(&colors.paint("'", "2"));
+    out.push_str(&colors.paint("'", dim));
 
     out
 }
@@ -1975,7 +2164,12 @@ fn install_signal_handlers(stop: Arc<AtomicBool>) {
 
 fn main() {
     let cli = Cli::parse();
-    let log_colors = Colors::new(!cli.no_color);
+    let is_light = match cli.theme {
+        Theme::Light => true,
+        Theme::Dark => false,
+        Theme::Auto => detect_is_light_theme().unwrap_or(false),
+    };
+    let log_colors = Colors::new(!cli.no_color, is_light);
     let log_file_path = resolve_log_file_path(cli.log_file.clone());
     // --service-name is only meaningful when the logger is enabled; treat it
     // as an implicit --serve so users don't have to spell both out.
@@ -2038,7 +2232,7 @@ fn main() {
     // TCP server + recorder (only when --serve).
     let (manager, rec_tx) = if let Some(listener) = listener {
         let manager = Arc::new(ClientManager::new(
-            Colors::new(!cli.no_color),
+            Colors::new(!cli.no_color, is_light),
             !cli.interactive,
         ));
         {
@@ -2102,7 +2296,7 @@ fn main() {
         let (tx, rx) = mpsc::channel::<RxFrame>();
         let iface = cli.interface.clone();
         let ts_mode = cli.timestamp;
-        let colors = Colors::new(!cli.no_color);
+        let colors = Colors::new(!cli.no_color, is_light);
         let stop = stop.clone();
         let interactive = cli.interactive;
         let handle = thread::Builder::new()

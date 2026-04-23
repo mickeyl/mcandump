@@ -54,7 +54,10 @@ can drop frames under high bus load.
 - **Rich terminal output** — CAN IDs get a stable per-ID color
   (hash-based palette), data bytes are heat-mapped by value (dim gray
   for 0x00, cyan/green/yellow/red gradient, bold red for 0xFF),
-  printable ASCII in green
+  printable ASCII in green. Auto-detects light vs dark terminal themes
+  via OSC 11 (with `COLORFGBG` fallback) and switches to a dark-saturated
+  palette on paper-colored backgrounds where the default bright hues
+  would wash out — override with `--theme light` / `--theme dark`
 - **Interactive mode** — alternate-screen terminal UI with unbounded
   in-memory scrollback, cursor/page navigation, and search for payload
   byte sequences or arbitration IDs. Subtle per-column color coding
@@ -139,6 +142,9 @@ mcandump can0 --service-name "My CAN Logger"
 # Disable colors (for piping)
 mcandump can0 --no-color
 
+# Force the light/dark palette if auto-detection gets it wrong
+mcandump can0 --theme light
+
 # Interactive scroll/search mode
 mcandump can0 --interactive
 
@@ -199,6 +205,7 @@ channel, so slow disk I/O does not block the SocketCAN receive loop.
 |---|---|---|
 | `-t, --timestamp MODE` | `absolute`, `delta`, or `none` | `absolute` |
 | `--no-color` | Disable colored terminal output | off |
+| `--theme MODE` | `auto`, `light`, or `dark` — picks the color palette | `auto` |
 | `-q, --quiet` | Suppress terminal display (TCP forwarding only) | off |
 | `--interactive` | Interactive terminal UI with scrollback and search | off |
 | `-f, --log-file [PATH]` | Write a candump-compatible logfile (auto-named if PATH omitted) | off |

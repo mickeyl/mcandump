@@ -41,25 +41,27 @@ Single-file application: everything is in `src/main.rs`. No modules, no library 
 
 2. **ECUconnect protocol** — `pack_ecuconnect_frame()` serializes `RxFrame` into the binary wire format: `[timestamp:8][id:4][flags:1][dlc:1][data:0-64]`, big-endian. Flags: bit0=extended, bit1=FD, bit2=BRS, bit3=ESI.
 
-3. **CLI** — clap derive macros. `TimestampMode` enum (absolute/delta/none). Options for color, quiet, service name. Port is always auto-picked; zeroconf is mandatory.
+3. **CLI** — clap derive macros. `TimestampMode` enum (absolute/delta/none), `Theme` enum (auto/light/dark). Options for color, theme, quiet, service name. Port is always auto-picked; zeroconf is mandatory.
 
-4. **TCP client management** — `ClientManager` holds a `Mutex<Vec<ClientHandle>>`. Each client gets a dedicated writer thread with its own unbounded `mpsc` channel. `broadcast()` fans out an `Arc<Vec<u8>>` to every client channel — never blocks, never drops frames. A slow client only backs up its own queue. Shared `Stats` (frames_sent/dropped/bytes) are tracked via `Arc<Stats>` with atomics.
+4. **Theme detection** — `detect_is_light_theme()` queries the terminal background via OSC 11 (`ESC ] 11 ; ? BEL`), parses the `rgb:RRRR/GGGG/BBBB` response, and decides by luminance (`0.2126·R + 0.7152·G + 0.0722·B > 0.5` ⇒ light). Falls back to parsing `$COLORFGBG`. Only runs on TTYs; stdin is briefly switched to non-canonical no-echo via `tcsetattr` with a `Drop`-guarded restore, 200 ms VTIME, 500 ms total budget. Result drives `Colors::is_light`, which flips `id_color` / `data_byte` / `ascii_char` / `dim_code` / `iface_code` / `fd_code` / `data_interactive_code` to a dark-saturated 256-color palette suited to paper-colored backgrounds.
 
-5. **Recording thread** — `run_recorder()` drains the unbounded recorder channel, packs each `RxFrame` into the ECUconnect binary format, wraps it in `Arc`, and fans out to all client channels via `broadcast()`.
+5. **TCP client management** — `ClientManager` holds a `Mutex<Vec<ClientHandle>>`. Each client gets a dedicated writer thread with its own unbounded `mpsc` channel. `broadcast()` fans out an `Arc<Vec<u8>>` to every client channel — never blocks, never drops frames. A slow client only backs up its own queue. Shared `Stats` (frames_sent/dropped/bytes) are tracked via `Arc<Stats>` with atomics.
 
-6. **Display thread** — `run_display()` runs at `nice(10)` (lower priority than all other threads). Drains its own unbounded channel and formats frames to stdout. Never interferes with CAN reading or TCP recording.
+6. **Recording thread** — `run_recorder()` drains the unbounded recorder channel, packs each `RxFrame` into the ECUconnect binary format, wraps it in `Arc`, and fans out to all client channels via `broadcast()`.
 
-7. **TCP server** — Non-blocking accept loop in a background thread. Each accepted client is registered via `add_client()`, which spawns its per-client writer thread.
+7. **Display thread** — `run_display()` runs at `nice(10)` (lower priority than all other threads). Drains its own unbounded channel and formats frames to stdout. Never interferes with CAN reading or TCP recording.
 
-8. **Zeroconf** — Uses `mdns-sd` crate. Registers service type `_ecuconnect-log._tcp.local.` with name prefix `ECUconnect-Logger`. TXT records carry system, process, interface, channel metadata. Only active when `--serve` (or `--service-name`, which implies it) is passed; when active, startup fails hard if registration fails.
+8. **TCP server** — Non-blocking accept loop in a background thread. Each accepted client is registered via `add_client()`, which spawns its per-client writer thread.
 
-9. **Display formatting** — Rich candump-style terminal output. CAN IDs get a stable per-ID color (hash-based palette) so the same ECU always appears in the same hue. Data bytes are heat-mapped by value (dim gray for 0x00, cyan/green/yellow/red gradient, bold red for 0xFF). ASCII column colors printable chars green, non-printable dim.
+9. **Zeroconf** — Uses `mdns-sd` crate. Registers service type `_ecuconnect-log._tcp.local.` with name prefix `ECUconnect-Logger`. TXT records carry system, process, interface, channel metadata. Only active when `--serve` (or `--service-name`, which implies it) is passed; when active, startup fails hard if registration fails.
+
+10. **Display formatting** — Rich candump-style terminal output. CAN IDs get a stable per-ID color (hash-based palette) so the same ECU always appears in the same hue. Data bytes are heat-mapped by value (dim gray for 0x00, cyan/green/yellow/red gradient, bold red for 0xFF). ASCII column colors printable chars green, non-printable dim.
 
     Interactive mode adds a vim-style visual selection (`select_anchor: Option<usize>`): pressing `v` drops the anchor at the cursor, and every existing navigation key extends the highlighted range. `y` yanks the range as candump log lines, `Y` as compact `ID#DATA`, `V` yanks every frame matching the current search. The clipboard transport is an OSC 52 escape sequence (`\x1b]52;c;<base64>\x07`) written straight to stdout — no external tool needed, works over SSH. Base64 is hand-rolled (~25 lines) to keep the dependency count low.
 
-10. **Signal handling** — Global `OnceLock<Arc<AtomicBool>>` + libc signal handler for clean SIGINT/SIGTERM shutdown. SO_RCVTIMEO on the CAN socket ensures the read loop checks the stop flag every 500ms.
+11. **Signal handling** — Global `OnceLock<Arc<AtomicBool>>` + libc signal handler for clean SIGINT/SIGTERM shutdown. SO_RCVTIMEO on the CAN socket ensures the read loop checks the stop flag every 500ms.
 
-11. **main()** — Opens CAN socket, binds TCP, installs signals, starts server/recorder/display threads, starts zeroconf. The main loop only reads CAN frames and pushes to unbounded channels — it never touches TCP or stdout.
+12. **main()** — Opens CAN socket, binds TCP, installs signals, starts server/recorder/display threads, starts zeroconf. The main loop only reads CAN frames and pushes to unbounded channels — it never touches TCP or stdout.
 
 **Threading model:**
 
