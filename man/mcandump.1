@@ -1,4 +1,4 @@
-.TH MCANDUMP 1 "April 2026" "mcandump 2.4.0" "User Commands"
+.TH MCANDUMP 1 "April 2026" "mcandump 2.6.0" "User Commands"
 .SH NAME
 mcandump \- SocketCAN dumper and optional CANcorder logger proxy
 .SH SYNOPSIS
@@ -85,6 +85,20 @@ and does not touch the network.
 Override the advertised Zeroconf service name. Implies
 .BR --serve .
 .TP
+.BI \-\-yank-to " " { clipboard | primary | both }
+Which X11/Wayland selection(s) interactive yanks should populate. Defaults to
+.B clipboard
+(Ctrl-V paste), matching the freedesktop.org clipboards spec which reserves
+.B primary
+for live mouse selections. Use
+.B primary
+or
+.B both
+to make yanks pasteable with the middle mouse button. No-op on macOS/Windows
+and in terminals whose OSC 52 implementation ignores the
+.B p
+selection field.
+.TP
 .BR \-h ", " \-\-help
 Show command-line help.
 .TP
@@ -139,7 +153,18 @@ selection is active) to the system clipboard as candump log lines
 .RI ( (sec.us)\  iface\  ID#DATA ).
 The transfer uses the terminal's OSC 52 escape sequence, so no external helper
 .RB ( xclip ", " wl-copy ", " pbcopy )
-is required and the copy works over SSH. Inside
+is required and the copy works over SSH. On Linux yanks populate the
+.B CLIPBOARD
+selection (pasted with Ctrl-V) by default, matching the freedesktop.org
+clipboards spec which reserves
+.B PRIMARY
+for live mouse selections. Use
+.BR --yank-to " " primary
+or
+.BR --yank-to " " both
+to also populate the
+.B PRIMARY
+selection, making yanks pasteable with the middle mouse button. Inside
 .BR tmux ,
 enable passthrough with
 .BR "set -g set-clipboard on" .
@@ -155,6 +180,14 @@ down with
 .BR /
 or
 .BR i .
+.TP
+.B a
+Yank the entire capture buffer as candump log lines, regardless of cursor,
+selection, or active search.
+.TP
+.B A
+Yank the entire capture buffer as compact hex-only
+.RB ( ID#DATA ).
 .TP
 .B c
 Clear the in-memory frame buffer, reset the cursor to the top, and resume

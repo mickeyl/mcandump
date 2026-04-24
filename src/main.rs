@@ -115,6 +115,24 @@ enum Theme {
     Dark,
 }
 
+/// Target selection buffer(s) for interactive yank (OSC 52).
+///
+/// Linux has two independent clipboard selections: `CLIPBOARD` (pasted with
+/// Ctrl-V) and `PRIMARY` (pasted with middle-click, conventionally populated
+/// only by mouse selections). The freedesktop.org clipboards spec reserves
+/// `PRIMARY` for live mouse selections; an explicit copy action like `y`
+/// should target `CLIPBOARD` only — hence the default. `primary` or `both`
+/// are available for users who prefer middle-click paste in their workflow.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum YankTarget {
+    /// Populate the `CLIPBOARD` selection only (Ctrl-V paste). Spec-compliant default.
+    Clipboard,
+    /// Populate the `PRIMARY` selection only (middle-click paste).
+    Primary,
+    /// Populate both selections.
+    Both,
+}
+
 /// Enhanced candump for SocketCAN — rich colors, interactive scrollback/search,
 /// auto theme detection. Optional CANcorder logger.
 ///
@@ -164,6 +182,16 @@ struct Cli {
     /// Custom Zeroconf service name (default: "ECUconnect-Logger <hostname>:<port>"). Implies --serve.
     #[arg(long)]
     service_name: Option<String>,
+
+    /// Which X11/Wayland selection(s) interactive yanks should populate
+    ///
+    /// Defaults to `clipboard` (Ctrl-V paste), matching the freedesktop.org
+    /// clipboards spec which reserves `primary` for mouse selections. Use
+    /// `primary` or `both` to also make yanks pasteable with middle-click.
+    /// No-op on macOS/Windows (they have one clipboard) and in terminals
+    /// that don't honor the `p` selection in OSC 52.
+    #[arg(long, value_enum, default_value_t = YankTarget::Clipboard)]
+    yank_to: YankTarget,
 }
 
 // ── Theme detection ───────────────────────────────────────────────────────
@@ -981,6 +1009,8 @@ struct InteractiveState {
     /// When set, a vim-style visual selection is active and the range
     /// `[min(anchor, selected), max(anchor, selected)]` is highlighted.
     select_anchor: Option<usize>,
+    /// Which X11/Wayland selection(s) yanks should populate.
+    yank_target: YankTarget,
 }
 
 impl InteractiveState {
@@ -994,6 +1024,7 @@ impl InteractiveState {
             prompt: None,
             tail_size: 0,
             select_anchor: None,
+            yank_target: YankTarget::Clipboard,
         }
     }
 
@@ -1074,6 +1105,22 @@ impl InteractiveState {
         self.deliver_yank(&lines, fmt, "Copied matches for");
     }
 
+    fn yank_all(&mut self, iface: &str, fmt: YankFormat) {
+        if self.frames.is_empty() {
+            self.status = "Buffer is empty.".to_string();
+            return;
+        }
+        let lines: Vec<String> = self
+            .frames
+            .iter()
+            .map(|frame| match fmt {
+                YankFormat::Candump => format_candump_log_line(frame, iface),
+                YankFormat::Hex => format_candump_frame(frame),
+            })
+            .collect();
+        self.deliver_yank(&lines, fmt, "Copied entire buffer:");
+    }
+
     fn deliver_yank(&mut self, lines: &[String], fmt: YankFormat, prefix: &str) {
         let text: String = lines
             .iter()
@@ -1081,12 +1128,13 @@ impl InteractiveState {
             .collect();
         let count = lines.len();
         let bytes = text.len();
-        match copy_to_clipboard_osc52(&text) {
+        match copy_to_clipboard_osc52(&text, self.yank_target) {
             Ok(()) => {
                 self.status = format!(
-                    "{prefix} {count} frame{plural} ({bytes} bytes, {fmt_label}) → clipboard (OSC 52).",
+                    "{prefix} {count} frame{plural} ({bytes} bytes, {fmt_label}) → {target} (OSC 52).",
                     plural = if count == 1 { "" } else { "s" },
                     fmt_label = fmt.label(),
+                    target = yank_target_label(self.yank_target),
                 );
             }
             Err(err) => {
@@ -1259,6 +1307,8 @@ impl InteractiveState {
             KeyCode::Char('y') => self.yank_selection(iface, YankFormat::Candump),
             KeyCode::Char('Y') => self.yank_selection(iface, YankFormat::Hex),
             KeyCode::Char('V') => self.yank_all_matches(iface, YankFormat::Candump),
+            KeyCode::Char('a') => self.yank_all(iface, YankFormat::Candump),
+            KeyCode::Char('A') => self.yank_all(iface, YankFormat::Hex),
             KeyCode::Esc => {
                 if self.select_anchor.take().is_some() {
                     self.status = "Selection cancelled.".to_string();
@@ -1338,6 +1388,7 @@ fn run_interactive_display(
     ts_mode: TimestampMode,
     colors: Colors,
     stop: Arc<AtomicBool>,
+    yank_target: YankTarget,
 ) {
     unsafe {
         libc::nice(10);
@@ -1353,6 +1404,7 @@ fn run_interactive_display(
     };
 
     let mut state = InteractiveState::new();
+    state.yank_target = yank_target;
     let tick = Duration::from_millis(50);
     let mut needs_redraw = true;
 
@@ -1572,7 +1624,7 @@ fn draw_interactive(
 
     // ── Help bar ─────────────────────────────────────────────────────────
     let help =
-        "/ bytes  i ID  n/N next  v sel  y copy  Y hex  V all-matches  c clear  arrows scroll  q quit";
+        "/ bytes  i ID  n/N next  v sel  y/Y copy  V matches  a/A all  c clear  arrows scroll  q quit";
     queue!(
         stdout,
         MoveTo(0, help_row),
@@ -1694,11 +1746,21 @@ fn truncate_to_width(text: &str, width: usize) -> String {
 
 // ── Clipboard via OSC 52 ──────────────────────────────────────────────────
 //
-// OSC 52 (\x1b]52;c;<base64>\x07) asks the terminal emulator to put the
+// OSC 52 (\x1b]52;<sel>;<base64>\x07) asks the terminal emulator to put the
 // decoded payload into the system clipboard.  Works across kitty, WezTerm,
 // Alacritty, iTerm2, modern gnome-terminal, and tmux (when configured with
 // `set -g set-clipboard on`), including over SSH.  Terminals that don't
 // implement OSC 52 silently drop the sequence.
+//
+// Linux has two independent selection buffers: `CLIPBOARD` (populated by
+// Ctrl-C, pasted with Ctrl-V) and `PRIMARY` (auto-populated by mouse
+// selection, pasted with middle-click). The freedesktop.org clipboards
+// spec reserves `PRIMARY` for live mouse selections and asks explicit
+// copy actions to only touch `CLIPBOARD` — that's our default. Users who
+// want middle-click paste can opt in via `--yank-to primary|both`. When
+// targeting both, we send two separate sequences rather than a single
+// "cp" selection string, since some terminals only parse the first
+// character of the selection field.
 
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1726,11 +1788,24 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-fn copy_to_clipboard_osc52(payload: &str) -> io::Result<()> {
+fn copy_to_clipboard_osc52(payload: &str, target: YankTarget) -> io::Result<()> {
     let encoded = base64_encode(payload.as_bytes());
     let mut stdout = io::stdout().lock();
-    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    if matches!(target, YankTarget::Clipboard | YankTarget::Both) {
+        write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    }
+    if matches!(target, YankTarget::Primary | YankTarget::Both) {
+        write!(stdout, "\x1b]52;p;{encoded}\x07")?;
+    }
     stdout.flush()
+}
+
+fn yank_target_label(target: YankTarget) -> &'static str {
+    match target {
+        YankTarget::Clipboard => "clipboard",
+        YankTarget::Primary => "primary",
+        YankTarget::Both => "clipboard+primary",
+    }
 }
 
 // ── TCP server ────────────────────────────────────────────────────────────
@@ -2315,11 +2390,12 @@ fn main() {
         let colors = Colors::new(!cli.no_color, is_light);
         let stop = stop.clone();
         let interactive = cli.interactive;
+        let yank_target = cli.yank_to;
         let handle = thread::Builder::new()
             .name("display".into())
             .spawn(move || {
                 if interactive {
-                    run_interactive_display(rx, iface, ts_mode, colors, stop);
+                    run_interactive_display(rx, iface, ts_mode, colors, stop, yank_target);
                 } else {
                     run_display(rx, iface, ts_mode, colors);
                 }

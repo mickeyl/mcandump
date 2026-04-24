@@ -187,6 +187,8 @@ mcandump can0 --log-file
   frame) to the system clipboard as candump log lines
 - `Y` — yank as compact hex-only (`ID#DATA`, no timestamp or interface)
 - `V` — yank every frame that matches the active search
+- `a` — yank the **entire capture buffer** as candump log lines
+- `A` — yank the **entire capture buffer** as compact hex-only
 - `q` — exit `mcandump`
 - `Esc` — cancel the current search prompt, or the active selection
 
@@ -195,6 +197,15 @@ it needs no external helper (`xclip`, `wl-copy`, `pbcopy`, …) and works
 over SSH too. Any modern terminal supports it (kitty, WezTerm,
 Alacritty, iTerm2, recent gnome-terminal). Inside `tmux`, enable
 passthrough with `set -g set-clipboard on`.
+
+On Linux, yanks populate the `CLIPBOARD` selection by default — the
+one you paste with `Ctrl-V`. This matches the freedesktop.org
+clipboards spec, which reserves the `PRIMARY` selection (middle-click
+paste) for live mouse selections. If you prefer middle-click paste to
+work after a yank, pass `--yank-to primary` (primary only) or
+`--yank-to both` (populate both selections). The flag is a no-op on
+macOS/Windows and in terminals whose OSC 52 implementation ignores the
+`p` selection field.
 
 In interactive mode the capture buffer grows without an internal limit;
 it is only bounded by the process memory available on the host.

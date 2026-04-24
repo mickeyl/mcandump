@@ -1,6 +1,6 @@
 [package]
 name = "mcandump"
-version = "2.5.0"
+version = "2.6.0"
 edition = "2021"
 rust-version = "1.94"
 description = "Enhanced candump for SocketCAN — rich colors, interactive scrollback/search, auto theme detection. Optional CANcorder logger."
