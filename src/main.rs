@@ -211,9 +211,8 @@ fn detect_is_light_theme() -> Option<bool> {
 }
 
 fn is_light_rgb((r, g, b): (u8, u8, u8)) -> bool {
-    let lum = 0.2126 * (r as f32 / 255.0)
-        + 0.7152 * (g as f32 / 255.0)
-        + 0.0722 * (b as f32 / 255.0);
+    let lum =
+        0.2126 * (r as f32 / 255.0) + 0.7152 * (g as f32 / 255.0) + 0.0722 * (b as f32 / 255.0);
     lum > 0.5
 }
 
@@ -350,8 +349,7 @@ impl Colors {
     /// paper-colored terminal schemes.
     fn id_color(&self, can_id: u32) -> &'static str {
         const PALETTE_DARK: &[&str] = &[
-            "1;36", "1;32", "1;33", "1;35", "1;34",
-            "36",   "32",   "33",   "35",   "34",
+            "1;36", "1;32", "1;33", "1;35", "1;34", "36", "32", "33", "35", "34",
         ];
         const PALETTE_LIGHT: &[&str] = &[
             "38;5;18",  // DarkBlue
@@ -365,7 +363,11 @@ impl Colors {
             "38;5;58",  // Yellow4 (olive)
             "38;5;26",  // DeepSkyBlue4c
         ];
-        let palette = if self.is_light { PALETTE_LIGHT } else { PALETTE_DARK };
+        let palette = if self.is_light {
+            PALETTE_LIGHT
+        } else {
+            PALETTE_DARK
+        };
         let idx = ((can_id as u64).wrapping_mul(2654435761) % palette.len() as u64) as usize;
         palette[idx]
     }
@@ -422,25 +424,53 @@ impl Colors {
     // colored themes, so the light variants use explicit 256-color grays /
     // dark hues instead.
     fn dim_code(&self) -> &'static str {
-        if self.is_light { "38;5;240" } else { "2" }
+        if self.is_light {
+            "38;5;240"
+        } else {
+            "2"
+        }
     }
     fn iface_code(&self) -> &'static str {
-        if self.is_light { "38;5;24" } else { "2;34" }
+        if self.is_light {
+            "38;5;24"
+        } else {
+            "2;34"
+        }
     }
     fn fd_code(&self) -> &'static str {
-        if self.is_light { "38;5;91" } else { "2;35" }
+        if self.is_light {
+            "38;5;91"
+        } else {
+            "2;35"
+        }
     }
     fn data_interactive_code(&self) -> &'static str {
-        if self.is_light { "38;5;24" } else { "36" }
+        if self.is_light {
+            "38;5;24"
+        } else {
+            "36"
+        }
     }
     fn ascii_printable_code(&self) -> &'static str {
-        if self.is_light { "38;5;22" } else { "32" }
+        if self.is_light {
+            "38;5;22"
+        } else {
+            "32"
+        }
     }
     fn ascii_nonprintable_code(&self) -> &'static str {
-        if self.is_light { "38;5;248" } else { "2;37" }
+        if self.is_light {
+            "38;5;248"
+        } else {
+            "2;37"
+        }
     }
     fn dlc_code(&self) -> &'static str {
-        if self.is_light { "38;5;244" } else { "38;5;245" }
+        if self.is_light {
+            "38;5;244"
+        } else {
+            "38;5;245"
+        }
     }
 }
 
@@ -929,7 +959,14 @@ fn run_display(rx: mpsc::Receiver<RxFrame>, iface: String, ts_mode: TimestampMod
     let mut previous_timestamp_us = None;
 
     for frame in rx {
-        let line = format_frame(&frame, &iface, ts_mode, previous_timestamp_us, &colors, true);
+        let line = format_frame(
+            &frame,
+            &iface,
+            ts_mode,
+            previous_timestamp_us,
+            &colors,
+            true,
+        );
         previous_timestamp_us = Some(frame.timestamp_us);
         let mut out = stdout.lock();
         let _ = writeln!(out, "{line}");
@@ -2512,6 +2549,14 @@ fn main() {
         log_colors.tag("stats", "34"),
         elapsed.as_secs_f64(),
     );
+    if let Some(ref path) = log_file_path {
+        eprintln!(
+            "{} {} candump log written to {}",
+            timestamp_now(),
+            log_colors.tag("log", "36"),
+            path.display(),
+        );
+    }
     if let Some(ref manager) = manager {
         let tcp_sent = manager.stats.frames_sent.load(Ordering::Relaxed);
         let tcp_dropped = manager.stats.frames_dropped.load(Ordering::Relaxed);
