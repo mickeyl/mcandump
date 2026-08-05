@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-mcandump is a CAN bus logger proxy for Linux, written in Rust. It reads CAN and CAN-FD frames from a SocketCAN interface and displays them on the terminal (like `candump`). The CANcorder logger side (TCP server + Zeroconf/mDNS advertisement) is opt-in via `--serve`; without that flag the tool has no network side effects and behaves like plain `candump`. When `--serve` is passed it also forwards frames to CANcorder clients via the ECUconnect Logger binary protocol over TCP and registers itself as a Zeroconf/mDNS service so CANcorder discovers it automatically.
+mcandump is an enhanced CAN and CAN-FD bus monitor for Linux, written in Rust. It reads SocketCAN frames, displays or logs them like `candump`, and can run content-aware end-to-end quality diagnostics with strict automation-friendly exit status. The CANcorder logger side (TCP server + Zeroconf/mDNS advertisement) is opt-in via `--serve`; without that flag the tool has no network side effects. When `--serve` is passed it also forwards frames to CANcorder clients via the ECUconnect Logger binary protocol over TCP and registers itself as a Zeroconf/mDNS service so CANcorder discovers it automatically.
 
 ## Build and test
 
@@ -12,11 +12,13 @@ mcandump is a CAN bus logger proxy for Linux, written in Rust. It reads CAN and 
 cargo build --release          # release build (LTO, stripped)
 cargo build                    # debug build
 make build                     # same as cargo build --release
+cargo test                     # parser, formatting, UI, and quality tests
 cargo clippy                   # lint
 cargo fmt                      # format
 ```
 
-There is no test suite — testing requires a SocketCAN interface. Set up virtual CAN for local testing:
+The unit test suite does not require CAN hardware. For an end-to-end SocketCAN
+smoke test, set up virtual CAN separately:
 
 ```bash
 sudo ip link add dev vcan0 type vcan && sudo ip link set up vcan0
@@ -41,29 +43,31 @@ Single-file application: everything is in `src/main.rs`. No modules, no library 
 
 2. **ECUconnect protocol** — `pack_ecuconnect_frame()` serializes `RxFrame` into the binary wire format: `[timestamp:8][id:4][flags:1][dlc:1][data:0-64]`, big-endian. Flags: bit0=extended, bit1=FD, bit2=BRS, bit3=ESI.
 
-3. **CLI** — clap derive macros. `TimestampMode` enum (absolute/delta/none), `Theme` enum (auto/light/dark). Options for color, theme, quiet, service name. Port is always auto-picked; zeroconf is mandatory.
+3. **CLI** — clap derive macros. `TimestampMode` controls timestamps and `Theme` controls terminal colors. Quality options select source/response IDs, test ID, report interval, and strict failure behavior. Logger options are independent; the port is auto-picked and Zeroconf is mandatory only when serving.
 
-4. **Theme detection** — `detect_is_light_theme()` queries the terminal background via OSC 11 (`ESC ] 11 ; ? BEL`), parses the `rgb:RRRR/GGGG/BBBB` response, and decides by luminance (`0.2126·R + 0.7152·G + 0.0722·B > 0.5` ⇒ light). Falls back to parsing `$COLORFGBG`. Only runs on TTYs; stdin is briefly switched to non-canonical no-echo via `tcsetattr` with a `Drop`-guarded restore, 200 ms VTIME, 500 ms total budget. Result drives `Colors::is_light`, which flips `id_color` / `data_byte` / `ascii_char` / `dim_code` / `iface_code` / `fd_code` / `data_interactive_code` to a dark-saturated 256-color palette suited to paper-colored backgrounds.
+4. **Quality diagnostics** — `parse_quality_frame()` validates legacy 8-byte `CA FE` frames and versioned CAN-FD `CA FD` frames, including CRC32C and deterministic payload pattern. `QualityAnalyzer` tracks each stream's sequences, duplicates, reordering, gaps, sender/receiver jitter, SocketCAN `SO_RXQ_OVFL` drops, pending relay requests, and request/response RTT. `--quality-strict` returns exit status 2 when the run is not clean or matching traffic is absent.
 
-5. **TCP client management** — `ClientManager` holds a `Mutex<Vec<ClientHandle>>`. Each client gets a dedicated writer thread with its own unbounded `mpsc` channel. `broadcast()` fans out an `Arc<Vec<u8>>` to every client channel — never blocks, never drops frames. A slow client only backs up its own queue. Shared `Stats` (frames_sent/dropped/bytes) are tracked via `Arc<Stats>` with atomics.
+5. **Theme detection** — `detect_is_light_theme()` queries the terminal background via OSC 11 (`ESC ] 11 ; ? BEL`), parses the `rgb:RRRR/GGGG/BBBB` response, and decides by luminance (`0.2126·R + 0.7152·G + 0.0722·B > 0.5` ⇒ light). Falls back to parsing `$COLORFGBG`. Only runs on TTYs; stdin is briefly switched to non-canonical no-echo via `tcsetattr` with a `Drop`-guarded restore, 200 ms VTIME, 500 ms total budget. Result drives `Colors::is_light`, which flips `id_color` / `data_byte` / `ascii_char` / `dim_code` / `iface_code` / `fd_code` / `data_interactive_code` to a dark-saturated 256-color palette suited to paper-colored backgrounds.
 
-6. **Recording thread** — `run_recorder()` drains the unbounded recorder channel, packs each `RxFrame` into the ECUconnect binary format, wraps it in `Arc`, and fans out to all client channels via `broadcast()`.
+6. **TCP client management** — `ClientManager` holds a `Mutex<Vec<ClientHandle>>`. Each client gets a dedicated writer thread with its own unbounded `mpsc` channel. `broadcast()` fans out an `Arc<Vec<u8>>` to every client channel — never blocks, never drops frames. A slow client only backs up its own queue. Shared `Stats` (frames_sent/dropped/bytes) are tracked via `Arc<Stats>` with atomics.
 
-7. **Display thread** — `run_display()` runs at `nice(10)` (lower priority than all other threads). Drains its own unbounded channel and formats frames to stdout. Never interferes with CAN reading or TCP recording.
+7. **Recording thread** — `run_recorder()` drains the unbounded recorder channel, packs each `RxFrame` into the ECUconnect binary format, wraps it in `Arc`, and fans out to all client channels via `broadcast()`.
 
-8. **TCP server** — Non-blocking accept loop in a background thread. Each accepted client is registered via `add_client()`, which spawns its per-client writer thread.
+8. **Display thread** — `run_display()` runs at `nice(10)` (lower priority than all other threads). Drains its own unbounded channel and formats frames to stdout. Never interferes with CAN reading or TCP recording.
 
-9. **Zeroconf** — Uses `mdns-sd` crate. Registers service type `_ecuconnect-log._tcp.local.` with name prefix `ECUconnect-Logger`. TXT records carry system, process, interface, channel metadata. Only active when `--serve` (or `--service-name`, which implies it) is passed; when active, startup fails hard if registration fails.
+9. **TCP server** — Non-blocking accept loop in a background thread. Each accepted client is registered via `add_client()`, which spawns its per-client writer thread.
 
-10. **Display formatting** — Rich candump-style terminal output. CAN IDs get a stable per-ID color (hash-based palette) so the same ECU always appears in the same hue. Data bytes are heat-mapped by value (dim gray for 0x00, cyan/green/yellow/red gradient, bold red for 0xFF). ASCII column colors printable chars green, non-printable dim.
+10. **Zeroconf** — Uses `mdns-sd` crate. Registers service type `_ecuconnect-log._tcp.local.` with name prefix `ECUconnect-Logger`. TXT records carry system, process, interface, channel metadata. Only active when `--serve` (or `--service-name`, which implies it) is passed; when active, startup fails hard if registration fails.
+
+11. **Display formatting** — Rich candump-style terminal output. CAN IDs get a stable per-ID color (hash-based palette) so the same ECU always appears in the same hue. Data bytes are heat-mapped by value (dim gray for 0x00, cyan/green/yellow/red gradient, bold red for 0xFF). ASCII column colors printable chars green, non-printable dim.
 
     Interactive mode adds a vim-style visual selection (`select_anchor: Option<usize>`): pressing `v` drops the anchor at the cursor, and every existing navigation key extends the highlighted range. `y` yanks the range as candump log lines, `Y` as compact `ID#DATA`, `V` yanks every frame matching the current search, `a`/`A` yank the entire capture buffer (candump / hex). `c` clears the in-memory buffer and resumes tail-following without quitting. The clipboard transport is an OSC 52 escape sequence written straight to stdout. Target selection is controlled by `--yank-to {clipboard,primary,both}` (default `clipboard`, following the freedesktop.org clipboards spec which reserves `PRIMARY` for live mouse selections); `both` emits two separate sequences rather than bundling the selections into one `cp` field, since some terminals only parse the first character. No external tool needed, works over SSH. Base64 is hand-rolled (~25 lines) to keep the dependency count low.
 
     The interface name is *not* rendered per row in interactive mode (it's constant for a session); `format_frame_interactive` omits it, and `format_frame` gained a `show_iface: bool` param so the selected-row highlight (which still goes through `format_frame` with plain colors for reverse video) stays pixel-aligned with the other rows. The iface is shown once in the status bar as `pos: N/M  <iface>: <mode>`.
 
-11. **Signal handling** — Global `OnceLock<Arc<AtomicBool>>` + libc signal handler for clean SIGINT/SIGTERM shutdown. SO_RCVTIMEO on the CAN socket ensures the read loop checks the stop flag every 500ms.
+12. **Signal handling** — Global `OnceLock<Arc<AtomicBool>>` + libc signal handler for clean SIGINT/SIGTERM shutdown. SO_RCVTIMEO on the CAN socket ensures the read loop checks the stop flag every 500ms.
 
-12. **main()** — Opens CAN socket, binds TCP, installs signals, starts server/recorder/display threads, starts zeroconf. The main loop only reads CAN frames and pushes to unbounded channels — it never touches TCP or stdout.
+13. **main()** — Opens the CAN socket, conditionally starts logger/display services, and feeds each received frame to the quality analyzer before downstream output. On shutdown it prints final quality statistics and applies strict-mode exit status. The hot read loop never performs TCP or terminal formatting itself.
 
 **Threading model:**
 
@@ -82,6 +86,16 @@ TCP server thread : accept connections → spawn per-client writers
 - CAN-FD is always enabled on the socket (graceful fallback if kernel doesn't support it).
 - SO_RCVTIMEO avoids blocking forever in read() so Ctrl-C is responsive.
 - Error/RTR frames are silently skipped (matching CANcorder Python loggers).
+
+## CAN diagnosis user story
+
+The motivating workflow pairs this receiver with `mcangen` and ESPenlaub
+hwtest. Linux sends deterministic Classic CAN or CAN-FD quality frames on a
+request ID, the MCU validates and optionally relays them on a response ID, and
+mcandump verifies the two streams and their round trips. The result must answer
+whether payloads were corrupted or frames were missing, duplicated, reordered,
+or dropped by the local receive queue. Preserve the shared quality wire format
+and the strict exit-code contract when changing the analyzer.
 
 ## Dependencies
 

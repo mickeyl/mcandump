@@ -46,6 +46,13 @@ const FRAME_FLAG_ESI: u8 = 1 << 3;
 
 const CANFD_FRAME_SIZE: usize = 72;
 const CAN_FRAME_SIZE: usize = 16;
+const SO_RXQ_OVFL: libc::c_int = 40;
+
+const QUALITY_CLASSIC_MAGIC: [u8; 2] = [0xCA, 0xFE];
+const QUALITY_FD_MAGIC: [u8; 2] = [0xCA, 0xFD];
+const QUALITY_FD_VERSION: u8 = 1;
+const QUALITY_FD_HEADER_LEN: usize = 24;
+const QUALITY_FD_CRC_LEN: usize = 4;
 
 // SO_TIMESTAMPING flags (from linux/net_tstamp.h)
 const SOF_TIMESTAMPING_SOFTWARE: u32 = 1 << 4;
@@ -91,6 +98,7 @@ struct RxFrame {
     len: usize,
     data: [u8; 64],
     timestamp_us: u64,
+    kernel_drops: u32,
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────
@@ -162,6 +170,30 @@ struct Cli {
     /// Suppress terminal frame display (TCP forwarding only)
     #[arg(short = 'q', long)]
     quiet: bool,
+
+    /// Validate mcangen/hwtest quality-test frames and print integrity statistics
+    #[arg(long)]
+    quality_test: bool,
+
+    /// Only validate quality-test frames on this request/source CAN ID
+    #[arg(long, value_parser = parse_can_id, requires = "quality_test")]
+    quality_id: Option<u32>,
+
+    /// Relay response CAN ID; enables request/response round-trip statistics
+    #[arg(long, value_parser = parse_can_id, requires = "quality_id")]
+    quality_response_id: Option<u32>,
+
+    /// Only validate this quality-test test ID
+    #[arg(long, value_parser = clap::value_parser!(u8), requires = "quality_test")]
+    quality_test_id: Option<u8>,
+
+    /// Quality statistics reporting interval in seconds (0 = final report only)
+    #[arg(long, default_value_t = 5, requires = "quality_test")]
+    quality_interval: u64,
+
+    /// Exit with status 2 if quality errors, missing frames, or kernel drops were detected
+    #[arg(long, requires = "quality_test")]
+    quality_strict: bool,
 
     /// Interactive terminal UI with scrollback and search
     #[arg(long, conflicts_with = "quiet")]
@@ -547,6 +579,17 @@ fn open_can_socket(ifname: &str, enable_fd: bool) -> io::Result<(i32, bool)> {
             mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
 
+        // Ask the kernel to attach the cumulative socket receive-queue drop
+        // counter to each frame as an SO_RXQ_OVFL control message.
+        let enable_overflow: libc::c_int = 1;
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            SO_RXQ_OVFL,
+            &enable_overflow as *const libc::c_int as *const libc::c_void,
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+
         // Request hardware timestamps if available, otherwise kernel timestamps.
         let ts_flags: u32 = SOF_TIMESTAMPING_RX_HARDWARE
             | SOF_TIMESTAMPING_RX_SOFTWARE
@@ -624,6 +667,7 @@ fn read_frame(fd: i32) -> io::Result<Option<RxFrame>> {
             .unwrap_or_default()
             .as_micros() as u64
     });
+    let kernel_drops = extract_kernel_drops(&msg).unwrap_or(0);
 
     // Both can_frame (16 bytes) and canfd_frame (72 bytes) share the same
     // first-8-byte layout: can_id(4) + len(1) + flags(1) + res(2).
@@ -661,6 +705,7 @@ fn read_frame(fd: i32) -> io::Result<Option<RxFrame>> {
         len,
         data,
         timestamp_us,
+        kernel_drops,
     }))
 }
 
@@ -698,6 +743,370 @@ fn extract_timestamp_us(msg: &libc::msghdr) -> Option<u64> {
     }
 
     best
+}
+
+fn extract_kernel_drops(msg: &libc::msghdr) -> Option<u32> {
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        while !cmsg.is_null() {
+            let hdr = &*cmsg;
+            if hdr.cmsg_level == libc::SOL_SOCKET && hdr.cmsg_type == SO_RXQ_OVFL {
+                return Some(*(libc::CMSG_DATA(cmsg) as *const u32));
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum QualityFormat {
+    Classic,
+    Fd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QualityFrame {
+    format: QualityFormat,
+    sequence: u64,
+    sender_tick_us: u64,
+    test_id: u8,
+    response: bool,
+}
+
+fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0x82F6_3B78u32 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+
+fn parse_quality_frame(frame: &RxFrame) -> Result<QualityFrame, &'static str> {
+    if !frame.is_fd && frame.len == 8 && frame.data[..2] == QUALITY_CLASSIC_MAGIC {
+        let checksum = frame.data[..7].iter().fold(0u8, |sum, byte| sum ^ byte);
+        if checksum != frame.data[7] {
+            return Err("classic checksum");
+        }
+        return Ok(QualityFrame {
+            format: QualityFormat::Classic,
+            sequence: u16::from_be_bytes([frame.data[2], frame.data[3]]) as u64,
+            sender_tick_us: u16::from_be_bytes([frame.data[4], frame.data[5]]) as u64 * 1_000,
+            test_id: frame.data[6],
+            response: false,
+        });
+    }
+
+    if frame.is_fd
+        && frame.len >= QUALITY_FD_HEADER_LEN + QUALITY_FD_CRC_LEN
+        && frame.data[..2] == QUALITY_FD_MAGIC
+    {
+        if frame.data[2] != QUALITY_FD_VERSION {
+            return Err("FD version");
+        }
+        if frame.data[5] as usize != frame.len {
+            return Err("FD length");
+        }
+        if u16::from_be_bytes([frame.data[6], frame.data[7]]) as usize != QUALITY_FD_HEADER_LEN {
+            return Err("FD header length");
+        }
+        let crc_offset = frame.len - QUALITY_FD_CRC_LEN;
+        let expected_crc = u32::from_be_bytes(
+            frame.data[crc_offset..frame.len]
+                .try_into()
+                .expect("four-byte CRC slice"),
+        );
+        if crc32c(&frame.data[..crc_offset]) != expected_crc {
+            return Err("FD CRC32C");
+        }
+        let sequence = u64::from_be_bytes(frame.data[8..16].try_into().expect("sequence slice"));
+        let test_id = frame.data[3];
+        for (offset, &byte) in frame.data[QUALITY_FD_HEADER_LEN..crc_offset]
+            .iter()
+            .enumerate()
+        {
+            let index = QUALITY_FD_HEADER_LEN + offset;
+            let expected = (sequence as u8)
+                .wrapping_add(index as u8)
+                .wrapping_add(test_id.rotate_left((index & 7) as u32));
+            if byte != expected {
+                return Err("FD payload pattern");
+            }
+        }
+        return Ok(QualityFrame {
+            format: QualityFormat::Fd,
+            sequence,
+            sender_tick_us: u64::from_be_bytes(
+                frame.data[16..24].try_into().expect("timestamp slice"),
+            ),
+            test_id,
+            response: frame.data[4] & 1 != 0,
+        });
+    }
+
+    Err("not a quality-test frame")
+}
+
+#[derive(Default)]
+struct QualityStreamStats {
+    received: u64,
+    missing: u64,
+    duplicates: u64,
+    reordered: u64,
+    max_gap: u64,
+    last_sequence: Option<u64>,
+    last_sender_tick_us: Option<u64>,
+    last_rx_us: Option<u64>,
+    jitter_samples: u64,
+    jitter_sum_us: u128,
+    jitter_max_us: u64,
+}
+
+impl QualityStreamStats {
+    fn observe(&mut self, quality: QualityFrame, rx_us: u64) {
+        self.received += 1;
+        if let Some(last) = self.last_sequence {
+            let (delta, forward) = match quality.format {
+                QualityFormat::Classic => {
+                    let delta = (quality.sequence as u16).wrapping_sub(last as u16) as u64;
+                    (delta, delta < 0x8000)
+                }
+                QualityFormat::Fd => {
+                    let delta = quality.sequence.wrapping_sub(last);
+                    (delta, delta < (1u64 << 63))
+                }
+            };
+            if delta == 0 {
+                self.duplicates += 1;
+                return;
+            }
+            if !forward {
+                self.reordered += 1;
+                return;
+            }
+            if delta > 1 {
+                let gap = delta - 1;
+                self.missing += gap;
+                self.max_gap = self.max_gap.max(gap);
+            }
+
+            if let (Some(last_sender), Some(last_rx)) = (self.last_sender_tick_us, self.last_rx_us)
+            {
+                let sender_delta = match quality.format {
+                    QualityFormat::Classic => {
+                        ((quality.sender_tick_us / 1_000) as u16)
+                            .wrapping_sub((last_sender / 1_000) as u16)
+                            as u64
+                            * 1_000
+                    }
+                    QualityFormat::Fd => quality.sender_tick_us.wrapping_sub(last_sender),
+                };
+                let rx_delta = rx_us.saturating_sub(last_rx);
+                let jitter = sender_delta.abs_diff(rx_delta);
+                self.jitter_samples += 1;
+                self.jitter_sum_us += jitter as u128;
+                self.jitter_max_us = self.jitter_max_us.max(jitter);
+            }
+        }
+        self.last_sequence = Some(quality.sequence);
+        self.last_sender_tick_us = Some(quality.sender_tick_us);
+        self.last_rx_us = Some(rx_us);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct QualityStreamKey {
+    can_id: u32,
+    test_id: u8,
+    format: QualityFormat,
+    response: bool,
+}
+
+struct QualityAnalyzer {
+    request_id: Option<u32>,
+    response_id: Option<u32>,
+    test_id: Option<u8>,
+    streams: HashMap<QualityStreamKey, QualityStreamStats>,
+    pending_roundtrips: HashMap<(u8, u64), u64>,
+    expired_roundtrips: u64,
+    corrupt: u64,
+    ignored: u64,
+    kernel_drops: u64,
+    last_kernel_drops: u32,
+    rtt_samples: u64,
+    rtt_sum_us: u128,
+    rtt_min_us: u64,
+    rtt_max_us: u64,
+    started: Instant,
+    last_report: Instant,
+}
+
+impl QualityAnalyzer {
+    fn new(request_id: Option<u32>, response_id: Option<u32>, test_id: Option<u8>) -> Self {
+        let now = Instant::now();
+        Self {
+            request_id,
+            response_id,
+            test_id,
+            streams: HashMap::new(),
+            pending_roundtrips: HashMap::new(),
+            expired_roundtrips: 0,
+            corrupt: 0,
+            ignored: 0,
+            kernel_drops: 0,
+            last_kernel_drops: 0,
+            rtt_samples: 0,
+            rtt_sum_us: 0,
+            rtt_min_us: u64::MAX,
+            rtt_max_us: 0,
+            started: now,
+            last_report: now,
+        }
+    }
+
+    fn observes_id(&self, can_id: u32) -> bool {
+        match (self.request_id, self.response_id) {
+            (Some(request), Some(response)) => can_id == request || can_id == response,
+            (Some(request), None) => can_id == request,
+            (None, _) => true,
+        }
+    }
+
+    fn observe(&mut self, frame: &RxFrame) {
+        let drop_delta = frame.kernel_drops.wrapping_sub(self.last_kernel_drops);
+        if frame.kernel_drops != 0 && drop_delta < (1u32 << 31) {
+            self.kernel_drops += drop_delta as u64;
+            self.last_kernel_drops = frame.kernel_drops;
+        }
+
+        if !self.observes_id(frame.can_id) {
+            return;
+        }
+        let has_magic = frame.len >= 2
+            && (frame.data[..2] == QUALITY_CLASSIC_MAGIC || frame.data[..2] == QUALITY_FD_MAGIC);
+        let quality = match parse_quality_frame(frame) {
+            Ok(quality) => quality,
+            Err(_) if self.request_id.is_some() || has_magic => {
+                self.corrupt += 1;
+                return;
+            }
+            Err(_) => {
+                self.ignored += 1;
+                return;
+            }
+        };
+        if self
+            .test_id
+            .is_some_and(|test_id| quality.test_id != test_id)
+        {
+            self.ignored += 1;
+            return;
+        }
+
+        let is_response_id = self.response_id == Some(frame.can_id);
+        let response = is_response_id || quality.response;
+        let key = QualityStreamKey {
+            can_id: frame.can_id,
+            test_id: quality.test_id,
+            format: quality.format,
+            response,
+        };
+        self.streams
+            .entry(key)
+            .or_default()
+            .observe(quality, frame.timestamp_us);
+
+        if self.response_id.is_some() {
+            let roundtrip_key = (quality.test_id, quality.sequence);
+            if is_response_id {
+                if let Some(request_us) = self.pending_roundtrips.remove(&roundtrip_key) {
+                    let rtt = frame.timestamp_us.saturating_sub(request_us);
+                    self.rtt_samples += 1;
+                    self.rtt_sum_us += rtt as u128;
+                    self.rtt_min_us = self.rtt_min_us.min(rtt);
+                    self.rtt_max_us = self.rtt_max_us.max(rtt);
+                }
+            } else if self.request_id == Some(frame.can_id) {
+                self.pending_roundtrips
+                    .insert(roundtrip_key, frame.timestamp_us);
+                if self.pending_roundtrips.len() > 65_536 {
+                    self.expired_roundtrips += self.pending_roundtrips.len() as u64;
+                    self.pending_roundtrips.clear();
+                }
+            }
+        }
+    }
+
+    fn due(&self, interval_seconds: u64) -> bool {
+        interval_seconds > 0 && self.last_report.elapsed() >= Duration::from_secs(interval_seconds)
+    }
+
+    fn report(&mut self, final_report: bool) {
+        let label = if final_report { "final" } else { "live" };
+        eprintln!(
+            "quality {label}: {:.1}s, streams={}, corrupt={}, kernel-drops={}, unmatched-requests={}",
+            self.started.elapsed().as_secs_f64(),
+            self.streams.len(),
+            self.corrupt,
+            self.kernel_drops,
+            self.pending_roundtrips.len() as u64 + self.expired_roundtrips,
+        );
+        let mut keys: Vec<_> = self.streams.keys().copied().collect();
+        keys.sort_by_key(|key| (key.can_id, key.test_id, key.response));
+        for key in keys {
+            let stats = &self.streams[&key];
+            let average_jitter = if stats.jitter_samples == 0 {
+                0.0
+            } else {
+                stats.jitter_sum_us as f64 / stats.jitter_samples as f64
+            };
+            eprintln!(
+                "  0x{:X} test={} {:?}{}: ok={} missing={} dup={} reorder={} max-gap={} jitter avg/max={:.1}/{} us",
+                key.can_id,
+                key.test_id,
+                key.format,
+                if key.response { " response" } else { "" },
+                stats.received,
+                stats.missing,
+                stats.duplicates,
+                stats.reordered,
+                stats.max_gap,
+                average_jitter,
+                stats.jitter_max_us,
+            );
+        }
+        if self.rtt_samples > 0 {
+            eprintln!(
+                "  round-trip: samples={} avg={:.1} us min={} us max={} us",
+                self.rtt_samples,
+                self.rtt_sum_us as f64 / self.rtt_samples as f64,
+                self.rtt_min_us,
+                self.rtt_max_us,
+            );
+        }
+        self.last_report = Instant::now();
+    }
+
+    fn has_failures(&self) -> bool {
+        self.streams.is_empty()
+            || self
+                .request_id
+                .is_some_and(|request_id| !self.streams.keys().any(|key| key.can_id == request_id))
+            || self.response_id.is_some_and(|response_id| {
+                self.rtt_samples == 0 || !self.streams.keys().any(|key| key.can_id == response_id)
+            })
+            || self.corrupt > 0
+            || self.kernel_drops > 0
+            || self.expired_roundtrips > 0
+            || !self.pending_roundtrips.is_empty()
+            || self
+                .streams
+                .values()
+                .any(|stats| stats.missing > 0 || stats.duplicates > 0 || stats.reordered > 0)
+    }
 }
 
 // ── ECUconnect Logger binary protocol ─────────────────────────────────────
@@ -2477,6 +2886,9 @@ fn main() {
     let mut frame_count: u64 = 0;
     let mut error_count: u64 = 0;
     let start_time = Instant::now();
+    let mut quality = cli.quality_test.then(|| {
+        QualityAnalyzer::new(cli.quality_id, cli.quality_response_id, cli.quality_test_id)
+    });
 
     while !stop.load(Ordering::Relaxed) {
         let frame = match read_frame(fd) {
@@ -2501,6 +2913,13 @@ fn main() {
         };
 
         frame_count += 1;
+
+        if let Some(analyzer) = quality.as_mut() {
+            analyzer.observe(&frame);
+            if analyzer.due(cli.quality_interval) {
+                analyzer.report(false);
+            }
+        }
 
         // Push to recorder (unbounded — never blocks)
         if let Some(ref rtx) = rec_tx {
@@ -2568,6 +2987,13 @@ fn main() {
         );
     }
 
+    let quality_failed = if let Some(analyzer) = quality.as_mut() {
+        analyzer.report(true);
+        analyzer.has_failures()
+    } else {
+        false
+    };
+
     if let Some(z) = zeroconf {
         stop_zeroconf(z, &log_colors);
     }
@@ -2578,6 +3004,9 @@ fn main() {
     }
     unsafe {
         libc::close(fd);
+    }
+    if cli.quality_strict && quality_failed {
+        std::process::exit(2);
     }
 }
 
@@ -2597,7 +3026,68 @@ mod tests {
             len: data.len(),
             data: payload,
             timestamp_us: 0,
+            kernel_drops: 0,
         }
+    }
+
+    fn quality_fd_frame(sequence: u64, test_id: u8) -> RxFrame {
+        let mut frame = sample_frame(0x700, &[0; 64]);
+        frame.is_fd = true;
+        frame.len = 64;
+        frame.data[0..2].copy_from_slice(&QUALITY_FD_MAGIC);
+        frame.data[2] = QUALITY_FD_VERSION;
+        frame.data[3] = test_id;
+        frame.data[5] = 64;
+        frame.data[6..8].copy_from_slice(&(QUALITY_FD_HEADER_LEN as u16).to_be_bytes());
+        frame.data[8..16].copy_from_slice(&sequence.to_be_bytes());
+        frame.data[16..24].copy_from_slice(&123_456u64.to_be_bytes());
+        for index in QUALITY_FD_HEADER_LEN..60 {
+            frame.data[index] = (sequence as u8)
+                .wrapping_add(index as u8)
+                .wrapping_add(test_id.rotate_left((index & 7) as u32));
+        }
+        let crc = crc32c(&frame.data[..60]);
+        frame.data[60..64].copy_from_slice(&crc.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn validates_quality_fd_payload_and_crc() {
+        let frame = quality_fd_frame(0x0102_0304_0506_0708, 17);
+        let parsed = parse_quality_frame(&frame).expect("valid quality FD frame");
+        assert_eq!(parsed.format, QualityFormat::Fd);
+        assert_eq!(parsed.sequence, 0x0102_0304_0506_0708);
+        assert_eq!(parsed.test_id, 17);
+
+        let mut corrupt = frame;
+        corrupt.data[30] ^= 1;
+        assert_eq!(parse_quality_frame(&corrupt), Err("FD CRC32C"));
+    }
+
+    #[test]
+    fn quality_stats_detect_gaps_duplicates_and_reordering() {
+        let mut stats = QualityStreamStats::default();
+        for (sequence, timestamp) in [(10, 10), (12, 20), (12, 30), (11, 40)] {
+            stats.observe(
+                QualityFrame {
+                    format: QualityFormat::Fd,
+                    sequence,
+                    sender_tick_us: timestamp,
+                    test_id: 0,
+                    response: false,
+                },
+                timestamp,
+            );
+        }
+        assert_eq!(stats.missing, 1);
+        assert_eq!(stats.duplicates, 1);
+        assert_eq!(stats.reordered, 1);
+    }
+
+    #[test]
+    fn strict_quality_requires_matching_traffic() {
+        let analyzer = QualityAnalyzer::new(Some(0x700), None, Some(1));
+        assert!(analyzer.has_failures());
     }
 
     #[test]

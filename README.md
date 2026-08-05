@@ -51,10 +51,35 @@ proxies, with zero-copy SocketCAN reads, per-client unbounded buffers
 (a slow client only backs up its own queue, never drops frames), and
 Zeroconf/mDNS auto-discovery.
 
+### End-to-end CAN diagnosis
+
+For a diagnostic run, frame counts alone are insufficient: a device can lose
+one frame, duplicate another, or return corrupted content while the totals
+still match. Quality mode pairs with `mcangen` and ESPenlaub hwtest to verify
+the complete Linux → CAN bus → MCU → CAN bus → Linux path:
+
+```bash
+# Start this first; exit status 2 means the diagnostic run was not clean
+mcandump can1 --quiet --quality-test --quality-id 0x700 \
+    --quality-response-id 0x701 --quality-test-id 1 --quality-strict
+
+# In another terminal, generate deterministic CAN-FD+BRS requests
+mcangen can1 --fd --brs --data-mode quality-test --id 0x700 \
+    --test-id 1 -r 1000 -n 30000
+```
+
+Configure the device under test with `twai quality relay 700 701 1` in
+ESPenlaub hwtest. mcandump then reports missing, duplicate, reordered, corrupt,
+and kernel-dropped frames plus relay round-trip latency. The same workflow also
+supports the compact 8-byte Classic CAN quality format.
+
 ## Features
 
 - **CAN and CAN-FD** — classic 8-byte frames and FD frames up to 64
   bytes, with BRS and ESI flag support
+- **Content-aware quality diagnostics** — validate Classic CAN and CAN-FD
+  sequence, payload, checksum/CRC, receive-queue drops, and relay RTT; strict
+  mode provides an automation-friendly failure status
 - **Opt-in CANcorder logger** — pass `--serve` to bind a TCP server and
   announce it via Zeroconf. Without it, mcandump is a pure terminal
   dumper with zero network side effects (mirrors `candump`)
@@ -97,7 +122,7 @@ Zeroconf/mDNS auto-discovery.
 ## Requirements
 
 - Linux with SocketCAN support (kernel 2.6.25+)
-- Rust toolchain 1.85+
+- Rust toolchain 1.94+
 - `CAP_NET_RAW` capability or root for raw CAN sockets
 
 ## Building
@@ -169,7 +194,20 @@ mcandump can0 --log-file capture.log
 
 # Let mcandump pick a candump-style default filename
 mcandump can0 --log-file
+
+# Validate Classic CAN or CAN-FD quality frames and fail on loss/corruption
+mcandump can1 --quiet --quality-test --quality-id 0x700 --quality-strict
+
+# Also correlate relay responses on 0x701 and report round-trip latency
+mcandump can1 --quiet --quality-test --quality-id 0x700 \
+    --quality-response-id 0x701 --quality-test-id 1 --quality-strict
 ```
+
+Quality mode understands the legacy 8-byte `CA FE` format and the versioned
+64-byte CAN-FD `CA FD` format produced by `mcangen --fd --data-mode
+quality-test` and ESPenlaub hwtest. It reports sequence gaps, duplicates,
+reordering, checksum/CRC or payload corruption, SocketCAN receive-queue drops,
+sender/receiver interval jitter, and request/response round-trip latency.
 
 ### Interactive shortcuts
 
@@ -234,6 +272,12 @@ channel, so slow disk I/O does not block the SocketCAN receive loop.
 | `--no-color` | Disable colored terminal output | off |
 | `--theme MODE` | `auto`, `light`, or `dark` — picks the color palette | `auto` |
 | `-q, --quiet` | Suppress terminal display (TCP forwarding only) | off |
+| `--quality-test` | Validate Classic/FD quality-test frames and print statistics | off |
+| `--quality-id ID` | Restrict validation to the request/source CAN ID | all quality frames |
+| `--quality-response-id ID` | Correlate relay responses and measure round-trip time | none |
+| `--quality-test-id ID` | Restrict validation to one test ID | all |
+| `--quality-interval SEC` | Live quality report interval (`0` = final only) | `5` |
+| `--quality-strict` | Exit 2 on loss, corruption, duplicates, reordering, or kernel drops | off |
 | `--interactive` | Interactive terminal UI with scrollback and search | off |
 | `-f, --log-file [PATH]` | Write a candump-compatible logfile (auto-named if PATH omitted) | off |
 | `--serve` | Enable the CANcorder logger (TCP server + Zeroconf) | off |

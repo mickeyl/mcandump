@@ -1,4 +1,4 @@
-.TH MCANDUMP 1 "April 2026" "mcandump 2.6.0" "User Commands"
+.TH MCANDUMP 1 "August 2026" "mcandump 2.7.0" "User Commands"
 .SH NAME
 mcandump \- SocketCAN dumper and optional CANcorder logger proxy
 .SH SYNOPSIS
@@ -11,6 +11,13 @@ a candump-like terminal view. With
 .BR --serve ,
 it also forwards the same traffic to CANcorder clients via the ECUconnect
 Logger protocol over TCP and announces the service via Zeroconf/mDNS.
+.PP
+Quality mode supports end-to-end CAN diagnosis with
+.BR mcangen (1)
+and ESPenlaub hwtest. It validates sequence and payload integrity rather than
+only comparing frame totals, detects local receive-queue drops, and can
+correlate MCU relay responses for round-trip measurements and strict automated
+pass/fail results.
 .PP
 By default it runs in line-oriented output mode with no network side effects.
 With
@@ -51,6 +58,30 @@ the wrong one.
 .TP
 .BR \-q ", " \-\-quiet
 Suppress terminal frame display and only forward traffic over TCP.
+.TP
+.BR \-\-quality\-test
+Validate legacy Classic CAN and versioned CAN-FD quality-test frames. Reports
+sequence gaps, duplicates, reordering, integrity errors, receive-queue drops,
+interval jitter, and optional relay round-trip latency.
+.TP
+.BI \-\-quality\-id " <id>"
+Restrict quality validation to the given request/source CAN ID.
+.TP
+.BI \-\-quality\-response\-id " <id>"
+Treat the given CAN ID as relay responses and correlate sequence numbers for
+round-trip statistics. Requires
+.BR \-\-quality\-id .
+.TP
+.BI \-\-quality\-test\-id " <id>"
+Only validate the selected quality protocol test ID.
+.TP
+.BI \-\-quality\-interval " <seconds>"
+Print live quality statistics at this interval. 0 prints only the final report
+(default: 5).
+.TP
+.BR \-\-quality\-strict
+Exit with status 2 when loss, corruption, duplicates, reordering, unmatched
+relay requests, or kernel receive-queue drops are detected.
 .TP
 .BR \-\-interactive
 Enable the interactive terminal UI. This conflicts with
@@ -224,6 +255,10 @@ Dump to the terminal and also forward traffic to CANcorder clients over TCP.
 .TP
 .B mcandump can0 --serve -q
 Forward traffic to TCP clients without writing frames to the terminal.
+.TP
+.B mcandump can1 --quiet --quality-test --quality-id 0x700 --quality-response-id 0x701 --quality-strict
+Validate quality traffic and relay responses, report round-trip timing, and
+return a failing exit status on integrity errors.
 .SH REQUIREMENTS
 mcandump requires Linux with SocketCAN support. Opening the CAN raw socket
 typically requires root privileges or the
