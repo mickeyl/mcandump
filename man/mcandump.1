@@ -1,4 +1,4 @@
-.TH MCANDUMP 1 "August 2026" "mcandump 2.7.0" "User Commands"
+.TH MCANDUMP 1 "August 2026" "mcandump 2.8.0" "User Commands"
 .SH NAME
 mcandump \- SocketCAN dumper and optional CANcorder logger proxy
 .SH SYNOPSIS
@@ -20,6 +20,12 @@ correlate MCU relay responses for round-trip measurements and strict automated
 pass/fail results.
 .PP
 By default it runs in line-oriented output mode with no network side effects.
+When standard output is a terminal, mcandump automatically sets its title via
+OSC 0. The title contains the interface, link/CAN state, nominal bitrate, and,
+when configured, the CAN-FD data bitrate. Redirected output is never modified.
+The previous title is restored on exit when the terminal supports the
+xterm-compatible title stack.
+.PP
 With
 .BR --interactive ,
 mcandump switches the terminal into an alternate-screen interactive viewer with

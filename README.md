@@ -39,6 +39,9 @@ when you're staring at bus traffic:
 - **Light/dark theme aware** — auto-detects the terminal background
   via OSC 11 (with a `COLORFGBG` fallback) and picks a palette that
   actually reads on paper-colored terminal schemes
+- **Automatic terminal title** — on a TTY, OSC 0 shows the active
+  interface, link/CAN state, nominal bitrate, and CAN-FD data bitrate;
+  redirected output remains free of escape sequences
 - **Interactive alternate-screen viewer** with unbounded scrollback,
   search by payload bytes or arbitration ID, vim-style visual
   selection, and OSC 52 clipboard yank that works over SSH

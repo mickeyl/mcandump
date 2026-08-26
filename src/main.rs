@@ -2404,6 +2404,21 @@ fn hostname() -> String {
 }
 
 fn get_can_interface_bitrate(ifname: &str) -> Option<u32> {
+    get_can_interface_config(ifname)?.bitrate
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct CanInterfaceConfig {
+    oper_state: Option<String>,
+    can_state: Option<String>,
+    mtu: Option<u32>,
+    bitrate: Option<u32>,
+    sample_point: Option<f64>,
+    data_bitrate: Option<u32>,
+    data_sample_point: Option<f64>,
+}
+
+fn get_can_interface_config(ifname: &str) -> Option<CanInterfaceConfig> {
     let ip_path = ["/usr/sbin/ip", "/sbin/ip"]
         .into_iter()
         .find(|candidate| Path::new(candidate).is_file())
@@ -2415,18 +2430,176 @@ fn get_can_interface_bitrate(ifname: &str) -> Option<u32> {
     if !output.status.success() {
         return None;
     }
-    parse_can_bitrate_from_ip_json(std::str::from_utf8(&output.stdout).ok()?)
+    Some(parse_can_interface_config_from_ip_json(
+        std::str::from_utf8(&output.stdout).ok()?,
+    ))
 }
 
-fn parse_can_bitrate_from_ip_json(json: &str) -> Option<u32> {
-    let key = "\"bitrate\"";
-    let start = json.find(key)? + key.len();
-    let value = json[start..].split_once(':')?.1.trim_start();
-    let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        None
+fn parse_can_interface_config_from_ip_json(json: &str) -> CanInterfaceConfig {
+    let info_data = json_object(json, "info_data").unwrap_or(json);
+    let nominal = json_object(info_data, "bittiming");
+    let data = json_object(info_data, "data_bittiming");
+
+    CanInterfaceConfig {
+        oper_state: json_scalar(json, "operstate").map(str::to_string),
+        can_state: json_scalar(info_data, "state").map(str::to_string),
+        mtu: json_scalar(json, "mtu").and_then(|value| value.parse().ok()),
+        // Older iproute2 versions emitted the nominal timing fields directly
+        // inside info_data, hence the fallback.
+        bitrate: nominal
+            .and_then(|object| json_scalar(object, "bitrate"))
+            .or_else(|| json_scalar(info_data, "bitrate"))
+            .and_then(|value| value.parse().ok()),
+        sample_point: nominal
+            .and_then(|object| json_scalar(object, "sample_point"))
+            .or_else(|| json_scalar(info_data, "sample_point"))
+            .and_then(|value| value.parse().ok()),
+        data_bitrate: data
+            .and_then(|object| json_scalar(object, "bitrate"))
+            .or_else(|| json_scalar(info_data, "dbitrate"))
+            .and_then(|value| value.parse().ok()),
+        data_sample_point: data
+            .and_then(|object| json_scalar(object, "sample_point"))
+            .or_else(|| json_scalar(info_data, "dsample_point"))
+            .and_then(|value| value.parse().ok()),
+    }
+}
+
+/// Return the JSON object stored under `key`, including its braces. This is a
+/// deliberately small parser for iproute2's stable JSON output and correctly
+/// skips braces inside quoted strings.
+fn json_object<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let marker = format!("\"{key}\"");
+    let after_key = &json[json.find(&marker)? + marker.len()..];
+    let value = after_key.split_once(':')?.1.trim_start();
+    if !value.starts_with('{') {
+        return None;
+    }
+
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&value[..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn json_scalar<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+    let marker = format!("\"{key}\"");
+    let after_key = &json[json.find(&marker)? + marker.len()..];
+    let value = after_key.split_once(':')?.1.trim_start();
+    if let Some(quoted) = value.strip_prefix('"') {
+        return quoted.split('"').next();
+    }
+    let end = value
+        .find(|ch: char| ch == ',' || ch == '}' || ch.is_ascii_whitespace())
+        .unwrap_or(value.len());
+    (end > 0).then_some(&value[..end])
+}
+
+fn format_bitrate(bitrate: u32) -> String {
+    let (scaled, unit) = if bitrate >= 1_000_000 {
+        (bitrate as f64 / 1_000_000.0, "Mbit/s")
     } else {
-        digits.parse().ok()
+        (bitrate as f64 / 1_000.0, "kbit/s")
+    };
+    let mut number = format!("{scaled:.3}");
+    while number.contains('.') && number.ends_with('0') {
+        number.pop();
+    }
+    if number.ends_with('.') {
+        number.pop();
+    }
+    format!("{number} {unit}")
+}
+
+fn format_can_timing(label: &str, bitrate: u32, sample_point: Option<f64>) -> String {
+    let sample_point = sample_point
+        .map(|point| format!(" @ {:.1}%", point * 100.0))
+        .unwrap_or_default();
+    format!("{label} {}{sample_point}", format_bitrate(bitrate))
+}
+
+fn format_can_terminal_title(ifname: &str, config: Option<&CanInterfaceConfig>) -> String {
+    let mut parts = vec!["mcandump".to_string(), ifname.to_string()];
+    if let Some(config) = config {
+        match (&config.oper_state, &config.can_state) {
+            (Some(oper), Some(can)) => parts.push(format!("{oper}/{can}")),
+            (Some(state), None) | (None, Some(state)) => parts.push(state.clone()),
+            (None, None) => {}
+        }
+        if let Some(bitrate) = config.bitrate {
+            parts.push(format_can_timing("CAN", bitrate, config.sample_point));
+        }
+        if let Some(bitrate) = config.data_bitrate {
+            parts.push(format_can_timing(
+                "CAN-FD",
+                bitrate,
+                config.data_sample_point,
+            ));
+        } else if config.mtu.is_some_and(|mtu| mtu > CAN_FRAME_SIZE as u32) {
+            parts.push("CAN-FD".to_string());
+        }
+    }
+    parts.join(" · ")
+}
+
+/// Automatically advertise the active CAN configuration in the terminal
+/// title. The title stack is an xterm-compatible extension; terminals that do
+/// not implement it simply keep mcandump's title after exit.
+struct TerminalTitle {
+    active: bool,
+}
+
+impl TerminalTitle {
+    fn set(title: &str) -> Self {
+        if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 0 {
+            return Self { active: false };
+        }
+        // Never allow control bytes from an interface name to terminate OSC 0.
+        let safe_title: String = title.chars().filter(|ch| !ch.is_control()).collect();
+        let result = (|| -> io::Result<()> {
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            // Save both icon name and window title, then set both via OSC 0.
+            write!(out, "\x1b[22;0t\x1b]0;{safe_title}\x07")?;
+            out.flush()
+        })();
+        Self {
+            active: result.is_ok(),
+        }
+    }
+}
+
+impl Drop for TerminalTitle {
+    fn drop(&mut self) {
+        if self.active {
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            let _ = write!(out, "\x1b[23;0t");
+            let _ = out.flush();
+        }
     }
 }
 
@@ -2871,6 +3044,14 @@ fn main() {
         None
     };
 
+    // OSC 0 is emitted only when stdout is a TTY, so candump-compatible pipes
+    // and redirected output never contain terminal control sequences.
+    let interface_config = get_can_interface_config(&cli.interface);
+    let terminal_title = TerminalTitle::set(&format_can_terminal_title(
+        &cli.interface,
+        interface_config.as_ref(),
+    ));
+
     if !cli.interactive {
         eprintln!(
             "{} {} Ready. Press Ctrl+C to stop.",
@@ -3005,6 +3186,7 @@ fn main() {
     unsafe {
         libc::close(fd);
     }
+    drop(terminal_title);
     if cli.quality_strict && quality_failed {
         std::process::exit(2);
     }
@@ -3216,7 +3398,10 @@ mod tests {
                 }
             }]
         "#;
-        assert_eq!(parse_can_bitrate_from_ip_json(json), Some(500_000));
+        assert_eq!(
+            parse_can_interface_config_from_ip_json(json).bitrate,
+            Some(500_000)
+        );
     }
 
     #[test]
@@ -3232,6 +3417,43 @@ mod tests {
                 }
             }]
         "#;
-        assert_eq!(parse_can_bitrate_from_ip_json(json), None);
+        assert_eq!(parse_can_interface_config_from_ip_json(json).bitrate, None);
+    }
+
+    #[test]
+    fn formats_terminal_title_from_nested_can_fd_config() {
+        let json = r#"
+            [{
+                "ifname": "can0",
+                "mtu": 72,
+                "operstate": "UP",
+                "linkinfo": {
+                    "info_kind": "can",
+                    "info_data": {
+                        "state": "ERROR-ACTIVE",
+                        "bittiming": {
+                            "bitrate": 500000,
+                            "sample_point": "0.875"
+                        },
+                        "data_bittiming": {
+                            "bitrate": 2000000,
+                            "sample_point": "0.800"
+                        }
+                    }
+                }
+            }]
+        "#;
+        let config = parse_can_interface_config_from_ip_json(json);
+        assert_eq!(config.bitrate, Some(500_000));
+        assert_eq!(config.data_bitrate, Some(2_000_000));
+        assert_eq!(
+            format_can_terminal_title("can0", Some(&config)),
+            "mcandump · can0 · UP/ERROR-ACTIVE · CAN 500 kbit/s @ 87.5% · CAN-FD 2 Mbit/s @ 80.0%"
+        );
+    }
+
+    #[test]
+    fn terminal_title_without_ip_details_still_names_interface() {
+        assert_eq!(format_can_terminal_title("vcan0", None), "mcandump · vcan0");
     }
 }
