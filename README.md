@@ -163,7 +163,8 @@ cargo build --release
 
 Download from
 [GitHub Releases](https://github.com/mickeyl/mcandump/releases)
-(x86_64 and aarch64, glibc and musl).
+(x86_64 and aarch64, glibc and musl). See [CHANGELOG.md](CHANGELOG.md)
+for the user-visible changes in each published release.
 
 ## Usage
 
