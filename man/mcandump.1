@@ -1,4 +1,4 @@
-.TH MCANDUMP 1 "September 2026" "mcandump 2.9.0" "User Commands"
+.TH MCANDUMP 1 "September 2026" "mcandump 2.9.1" "User Commands"
 .SH NAME
 mcandump \- SocketCAN dumper and optional CANcorder logger proxy
 .SH SYNOPSIS
@@ -108,6 +108,9 @@ is given without
 mcandump creates a logfile in the current directory using a candump-style name
 such as
 .BR candump-2026-04-02_154530.log .
+If path names an existing directory, the timestamped logfile is created inside
+that directory instead. Automatically named files use numeric suffixes on
+collision to avoid overwriting existing captures.
 .TP
 .BR \-\-serve
 Enable the CANcorder logger: bind a TCP server on an auto-picked port and

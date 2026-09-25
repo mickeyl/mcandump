@@ -271,7 +271,10 @@ Use `--log-file <path>` to write a compact text logfile in the same
 style that `candump -L` / `candump -f` produces. If you pass
 `--log-file` without a path, `mcandump` generates a default filename in
 the current directory using the same style as `candump`, e.g.
-`candump-2026-04-02_154530.log`.
+`candump-2026-04-02_154530.log`. Pass an existing directory, for example
+`mcandump can0 -f /tmp`, to create that timestamped logfile inside the directory.
+Automatically named files use numeric suffixes if needed to avoid overwriting
+existing captures. Explicit file paths keep their existing behavior.
 
 ```text
 (1712345678.901234) can0 123#DEADBEEF

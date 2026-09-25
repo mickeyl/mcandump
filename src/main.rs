@@ -201,6 +201,7 @@ struct Cli {
 
     /// Write a candump-compatible log file on a background thread
     ///
+    /// If PATH is a directory, creates a timestamped log inside it.
     /// If PATH is omitted, uses candump-YYYY-MM-DD_HHMMSS.log in the current directory.
     #[arg(short = 'f', long = "log-file", value_name = "PATH", num_args = 0..=1)]
     log_file: Option<Option<PathBuf>>,
@@ -1236,6 +1237,7 @@ impl LogSession {
 fn resolve_log_file_path(arg: Option<Option<PathBuf>>) -> Option<PathBuf> {
     match arg {
         None => None,
+        Some(Some(path)) if path.is_dir() => Some(path.join(default_candump_log_filename())),
         Some(Some(path)) => Some(path),
         Some(None) => Some(PathBuf::from(default_candump_log_filename())),
     }
@@ -3004,6 +3006,11 @@ fn main() {
         Theme::Auto => detect_is_light_theme().unwrap_or(false),
     };
     let log_colors = Colors::new(!cli.no_color, is_light);
+    let auto_log_name = match &cli.log_file {
+        Some(Some(path)) => path.is_dir(),
+        Some(None) => true,
+        None => false,
+    };
     let log_file_path = resolve_log_file_path(cli.log_file.clone());
     // --service-name is only meaningful when the logger is enabled; treat it
     // as an implicit --serve so users don't have to spell both out.
@@ -3098,7 +3105,12 @@ fn main() {
     // Noninteractive sessions are fed directly by the CAN receive loop.
     let log_session = Arc::new(Mutex::new(None));
     if let Some(ref path) = log_file_path {
-        match LogSession::start(path.clone(), cli.interface.clone(), false) {
+        let session = if auto_log_name {
+            LogSession::start_unique(path.clone(), &cli.interface)
+        } else {
+            LogSession::start(path.clone(), cli.interface.clone(), false)
+        };
+        match session {
             Ok(session) => {
                 *log_session.lock().unwrap() = Some(session);
             }
@@ -3112,7 +3124,7 @@ fn main() {
                 "{} {} Writing candump log to {}",
                 timestamp_now(),
                 log_colors.tag("log", "36"),
-                path.display()
+                log_session.lock().unwrap().as_ref().unwrap().path.display()
             );
         }
     }
@@ -3505,6 +3517,40 @@ mod tests {
             resolve_log_file_path(cli.log_file),
             Some(PathBuf::from("capture.log"))
         );
+    }
+
+    #[test]
+    fn log_directory_uses_timestamped_unique_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "mcandump-directory-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let cli =
+            Cli::try_parse_from(["mcandump", "can0", "-f", directory.to_str().unwrap()]).unwrap();
+        let path = resolve_log_file_path(cli.log_file).unwrap();
+        assert_eq!(path.parent(), Some(directory.as_path()));
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        assert!(filename.starts_with("candump-"));
+        assert!(filename.ends_with(".log"));
+        assert_eq!(filename.len(), "candump-2026-09-25_123456.log".len());
+        let first = LogSession::start_unique(path.clone(), "can0").unwrap();
+        let frame = sample_frame(0x123, &[0xCA, 0xFE]);
+        first.tx.send(frame.clone()).unwrap();
+        first.finish().unwrap();
+        let second = LogSession::start_unique(path.clone(), "can0").unwrap();
+        assert_ne!(second.path, path);
+        assert_eq!(second.path.parent(), Some(directory.as_path()));
+        second.finish().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            format!("{}\n", format_candump_log_line(&frame, "can0"))
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

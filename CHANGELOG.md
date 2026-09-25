@@ -5,6 +5,13 @@ published as GitHub releases. Changes made under intermediate version numbers
 without a published release are included in the next version users could
 download.
 
+## [2.9.1] - 2026-09-25
+
+- Fixed `-f` / `--log-file` with an existing directory: create a timestamped
+  candump log inside it instead of failing to open the directory as a file.
+- Automatically named startup logs now avoid overwriting existing captures
+  by adding numeric suffixes when filenames collide.
+
 ## [2.9.0] - 2026-09-25
 
 - Added interactive log creation and rotation: `l` starts from the keystroke;
@@ -87,6 +94,7 @@ download.
 - Added non-blocking fan-out with dedicated recorder, display, and per-client
   writer threads.
 
+[2.9.1]: https://github.com/mickeyl/mcandump/releases/tag/v2.9.1
 [2.9.0]: https://github.com/mickeyl/mcandump/releases/tag/v2.9.0
 [2.8.0]: https://github.com/mickeyl/mcandump/releases/tag/v2.8.0
 [2.6.1]: https://github.com/mickeyl/mcandump/releases/tag/v2.6.1
