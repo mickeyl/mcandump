@@ -5,6 +5,13 @@ published as GitHub releases. Changes made under intermediate version numbers
 without a published release are included in the next version users could
 download.
 
+## [2.9.0] - 2026-09-25
+
+- Added interactive log creation and rotation: `l` starts from the keystroke;
+  `L` includes the current capture buffer before continuing with new frames.
+- Both keys flush and close any active log. Automatic filenames avoid
+  overwriting existing files, and the status bar shows the active log path.
+
 ## [2.8.0] - 2026-08-26
 
 - Added content-aware end-to-end quality diagnostics for the deterministic
@@ -80,6 +87,7 @@ download.
 - Added non-blocking fan-out with dedicated recorder, display, and per-client
   writer threads.
 
+[2.9.0]: https://github.com/mickeyl/mcandump/releases/tag/v2.9.0
 [2.8.0]: https://github.com/mickeyl/mcandump/releases/tag/v2.8.0
 [2.6.1]: https://github.com/mickeyl/mcandump/releases/tag/v2.6.1
 [2.3.0]: https://github.com/mickeyl/mcandump/releases/tag/v2.3.0

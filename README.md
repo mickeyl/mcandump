@@ -225,6 +225,8 @@ sender/receiver interval jitter, and request/response round-trip latency.
 - `n` / `N` — jump to next / previous match
 - `v` — start / stop a vim-style visual selection (extend it with any
   navigation key — arrows, `PgUp`/`PgDn`, `Home`/`End`, `n`/`N`)
+- `l` — start a new candump log from now; flush and close any active log
+- `L` — start a new candump log including the current buffer; flush and close any active log
 - `y` — yank: copy the current visual selection (or just the cursor
   frame) to the system clipboard as candump log lines
 - `Y` — yank as compact hex-only (`ID#DATA`, no timestamp or interface)
@@ -253,6 +255,17 @@ In interactive mode the capture buffer grows without an internal limit;
 it is only bounded by the process memory available on the host.
 
 ### Candump Logfiles
+
+In `--interactive` mode, press `l` to start a new log from that moment,
+or `L` to first include the entire current capture buffer and then continue
+with new frames. Either key flushes and closes any active log (including one
+started with `--log-file`) and creates a new file. Frames removed with `c`
+are no longer in the buffer and cannot be included by `L`.
+
+Files are automatically named in the current directory, with numeric suffixes
+when needed so existing files are never overwritten by these shortcuts.
+The status bar shows the active path. If creating a new file fails, the
+existing log stays active. Logging continues until the next rotation or exit.
 
 Use `--log-file <path>` to write a compact text logfile in the same
 style that `candump -L` / `candump -f` produces. If you pass
@@ -351,7 +364,7 @@ Each CAN frame is transmitted as a binary packet over TCP:
 Main thread (default pri) : read CAN socket -> push to recorder + display + log channels
 Recorder thread           : recv frames -> pack -> fan out to per-client channels   (only with --serve)
 Per-client writer threads : drain own channel -> write_all to TCP socket            (only with --serve)
-Log writer thread         : drain own channel -> write candump-format logfile       (only with --log-file)
+Log writer thread         : drain own channel -> write candump-format logfile       (--log-file or interactive l/L)
 Display thread (nice +10) : drain channel -> format -> print to stdout
 TCP server thread         : accept connections -> spawn per-client writers          (only with --serve)
 ```

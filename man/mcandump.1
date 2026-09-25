@@ -1,4 +1,4 @@
-.TH MCANDUMP 1 "August 2026" "mcandump 2.8.0" "User Commands"
+.TH MCANDUMP 1 "September 2026" "mcandump 2.9.0" "User Commands"
 .SH NAME
 mcandump \- SocketCAN dumper and optional CANcorder logger proxy
 .SH SYNOPSIS
@@ -149,6 +149,16 @@ The interface name is shown once in the status bar at the bottom
 not on every row, so the payload and ASCII columns get the full line width.
 .PP
 Available shortcuts:
+.TP
+.B l
+Start a new candump log from the keystroke. Flush and close any active log first.
+.TP
+.B L
+Start a new candump log including the entire current capture buffer, then
+continue with new frames. Flush and close any active log first. Frames already
+removed with c are not included. Automatically generated filenames use numeric
+suffixes to avoid overwriting existing files. The status bar shows the active
+path. If a new file cannot be opened, the current log remains active.
 .TP
 .B Up / Down
 Move one frame up or down.

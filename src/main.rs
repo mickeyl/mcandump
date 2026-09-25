@@ -1187,6 +1187,52 @@ fn run_log_writer(rx: mpsc::Receiver<RxFrame>, iface: String, file: File) -> io:
     writer.flush()
 }
 
+struct LogSession {
+    path: PathBuf,
+    tx: mpsc::Sender<RxFrame>,
+    handle: thread::JoinHandle<io::Result<()>>,
+}
+
+impl LogSession {
+    fn start(path: PathBuf, iface: String, create_new: bool) -> io::Result<Self> {
+        let file = if create_new {
+            File::options().write(true).create_new(true).open(&path)?
+        } else {
+            File::create(&path)?
+        };
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::Builder::new()
+            .name("log-writer".into())
+            .spawn(move || run_log_writer(rx, iface, file))?;
+        Ok(Self { path, tx, handle })
+    }
+
+    fn finish(self) -> io::Result<()> {
+        drop(self.tx);
+        self.handle
+            .join()
+            .map_err(|_| io::Error::other("log writer thread panicked"))?
+    }
+
+    fn start_unique(path: PathBuf, iface: &str) -> io::Result<Self> {
+        for suffix in 0u64.. {
+            let candidate = if suffix == 0 {
+                path.clone()
+            } else {
+                path.with_file_name(format!(
+                    "{}-{suffix}.log",
+                    path.file_stem().unwrap_or_default().to_string_lossy()
+                ))
+            };
+            match Self::start(candidate, iface.to_string(), true) {
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                result => return result,
+            }
+        }
+        unreachable!()
+    }
+}
+
 fn resolve_log_file_path(arg: Option<Option<PathBuf>>) -> Option<PathBuf> {
     match arg {
         None => None,
@@ -1358,7 +1404,13 @@ fn run_recorder(rx: mpsc::Receiver<RxFrame>, manager: Arc<ClientManager>) {
 
 // ── Display thread (low priority) ─────────────────────────────────────────
 
-fn run_display(rx: mpsc::Receiver<RxFrame>, iface: String, ts_mode: TimestampMode, colors: Colors) {
+fn run_display(
+    rx: mpsc::Receiver<RxFrame>,
+    iface: String,
+    ts_mode: TimestampMode,
+    colors: Colors,
+    log_session: Option<Arc<Mutex<Option<LogSession>>>>,
+) {
     // Lower scheduling priority so display never starves CAN reading or recording
     unsafe {
         libc::nice(10);
@@ -1368,6 +1420,11 @@ fn run_display(rx: mpsc::Receiver<RxFrame>, iface: String, ts_mode: TimestampMod
     let mut previous_timestamp_us = None;
 
     for frame in rx {
+        if let Some(ref active) = log_session {
+            if let Some(session) = active.lock().unwrap().as_ref() {
+                let _ = session.tx.send(frame.clone());
+            }
+        }
         let line = format_frame(
             &frame,
             &iface,
@@ -1457,6 +1514,7 @@ struct InteractiveState {
     select_anchor: Option<usize>,
     /// Which X11/Wayland selection(s) yanks should populate.
     yank_target: YankTarget,
+    log_session: Arc<Mutex<Option<LogSession>>>,
 }
 
 impl InteractiveState {
@@ -1471,6 +1529,7 @@ impl InteractiveState {
             tail_size: 0,
             select_anchor: None,
             yank_target: YankTarget::Clipboard,
+            log_session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1590,6 +1649,11 @@ impl InteractiveState {
     }
 
     fn push_frame(&mut self, frame: RxFrame) {
+        if let Some(session) = self.log_session.lock().unwrap().as_ref() {
+            if session.tx.send(frame.clone()).is_err() {
+                self.status = "Log writer failed.".into();
+            }
+        }
         self.frames.push(frame);
         if self.follow_tail {
             self.selected = self.frames.len().saturating_sub(1);
@@ -1702,6 +1766,42 @@ impl InteractiveState {
         false
     }
 
+    fn start_logging(&mut self, iface: &str, include_buffer: bool, path: PathBuf) {
+        // Create the replacement first so an open failure leaves the active log intact.
+        let session = match LogSession::start_unique(path, iface) {
+            Ok(session) => session,
+            Err(err) => {
+                self.status = format!("Cannot start log: {err}");
+                return;
+            }
+        };
+        let mut active = self.log_session.lock().unwrap();
+        let previous_error = active.take().and_then(|previous| previous.finish().err());
+        if include_buffer {
+            for frame in &self.frames {
+                if session.tx.send(frame.clone()).is_err() {
+                    self.status = "Log writer failed while saving buffer.".into();
+                    let _ = session.finish();
+                    return;
+                }
+            }
+        }
+        self.status = format!(
+            "Logging to {}{}",
+            session.path.display(),
+            if include_buffer {
+                " (buffer included)"
+            } else {
+                ""
+            }
+        );
+        if let Some(err) = previous_error {
+            self.status
+                .push_str(&format!("; previous log flush failed: {err}"));
+        }
+        *active = Some(session);
+    }
+
     fn handle_key(
         &mut self,
         key: KeyEvent,
@@ -1749,6 +1849,11 @@ impl InteractiveState {
             KeyCode::Char('i') => self.start_prompt(PromptKind::ArbitrationId),
             KeyCode::Char('n') => self.repeat_search(true),
             KeyCode::Char('N') => self.repeat_search(false),
+            KeyCode::Char(c @ ('l' | 'L')) => self.start_logging(
+                iface,
+                c == 'L',
+                PathBuf::from(default_candump_log_filename()),
+            ),
             KeyCode::Char('v') => self.toggle_visual(),
             KeyCode::Char('y') => self.yank_selection(iface, YankFormat::Candump),
             KeyCode::Char('Y') => self.yank_selection(iface, YankFormat::Hex),
@@ -1801,7 +1906,15 @@ impl InteractiveState {
         } else {
             format!("{}  ", self.status)
         };
-        format!("{prefix}pos: {position}  {iface}: {mode}{selection}{search}")
+        let logging = self
+            .log_session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(String::new(), |session| {
+                format!("log: {}  ", session.path.display())
+            });
+        format!("{logging}{prefix}pos: {position}  {iface}: {mode}{selection}{search}")
     }
 }
 
@@ -1835,6 +1948,7 @@ fn run_interactive_display(
     colors: Colors,
     stop: Arc<AtomicBool>,
     yank_target: YankTarget,
+    log_session: Arc<Mutex<Option<LogSession>>>,
 ) {
     unsafe {
         libc::nice(10);
@@ -1844,13 +1958,14 @@ fn run_interactive_display(
         Ok(terminal) => terminal,
         Err(err) => {
             eprintln!("warning: interactive mode unavailable: {err}");
-            run_display(rx, iface, ts_mode, colors);
+            run_display(rx, iface, ts_mode, colors, Some(log_session));
             return;
         }
     };
 
     let mut state = InteractiveState::new();
     state.yank_target = yank_target;
+    state.log_session = log_session;
     let tick = Duration::from_millis(50);
     let mut needs_redraw = true;
 
@@ -1877,12 +1992,21 @@ fn run_interactive_display(
         }
 
         if stop.load(Ordering::Relaxed) {
+            for frame in rx {
+                state.push_frame(frame);
+            }
             break;
         }
 
         match event::poll(tick) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => {
+                    if state.prompt.is_none() && matches!(key.code, KeyCode::Char('l' | 'L')) {
+                        // Frames queued before the keystroke belong to the old capture.
+                        for frame in rx.try_iter() {
+                            state.push_frame(frame);
+                        }
+                    }
                     let rows = terminal::size().map(|(_, rows)| rows).unwrap_or(24) as usize;
                     let body_rows = rows.saturating_sub(2).max(1);
                     let tail_rows = if !state.follow_tail && body_rows >= 12 {
@@ -2070,7 +2194,7 @@ fn draw_interactive(
 
     // ── Help bar ─────────────────────────────────────────────────────────
     let help =
-        "/ bytes  i ID  n/N next  v sel  y/Y copy  V matches  a/A all  c clear  arrows scroll  q quit";
+        "l new log  L +buffer  / bytes  i ID  n/N next  v sel  y/Y copy  V matches  a/A all  c clear  arrows scroll  q quit";
     queue!(
         stdout,
         MoveTo(0, help_row),
@@ -2970,35 +3094,28 @@ fn main() {
         (None, None)
     };
 
-    // Background candump-compatible log writer.
-    let (log_tx, log_handle) = if let Some(ref path) = log_file_path {
-        let file = match File::create(path) {
-            Ok(file) => file,
+    // Interactive sessions are fed and rotated by the display thread.
+    // Noninteractive sessions are fed directly by the CAN receive loop.
+    let log_session = Arc::new(Mutex::new(None));
+    if let Some(ref path) = log_file_path {
+        match LogSession::start(path.clone(), cli.interface.clone(), false) {
+            Ok(session) => {
+                *log_session.lock().unwrap() = Some(session);
+            }
             Err(e) => {
                 eprintln!("error: cannot open log file {}: {e}", path.display());
                 std::process::exit(1);
             }
-        };
-
+        }
         if !cli.interactive {
             eprintln!(
                 "{} {} Writing candump log to {}",
                 timestamp_now(),
                 log_colors.tag("log", "36"),
-                path.display(),
+                path.display()
             );
         }
-
-        let (tx, rx) = mpsc::channel::<RxFrame>();
-        let iface = cli.interface.clone();
-        let handle = thread::Builder::new()
-            .name("log-writer".into())
-            .spawn(move || run_log_writer(rx, iface, file))
-            .expect("cannot spawn log writer thread");
-        (Some(tx), Some(handle))
-    } else {
-        (None, None)
-    };
+    }
 
     // Display thread — low priority (nice +10) so it never starves CAN reading
     // or recording.  Gets its own unbounded channel.
@@ -3010,13 +3127,22 @@ fn main() {
         let stop = stop.clone();
         let interactive = cli.interactive;
         let yank_target = cli.yank_to;
+        let log_session = log_session.clone();
         let handle = thread::Builder::new()
             .name("display".into())
             .spawn(move || {
                 if interactive {
-                    run_interactive_display(rx, iface, ts_mode, colors, stop, yank_target);
+                    run_interactive_display(
+                        rx,
+                        iface,
+                        ts_mode,
+                        colors,
+                        stop,
+                        yank_target,
+                        log_session,
+                    );
                 } else {
-                    run_display(rx, iface, ts_mode, colors);
+                    run_display(rx, iface, ts_mode, colors, None);
                 }
             })
             .expect("cannot spawn display thread");
@@ -3108,8 +3234,10 @@ fn main() {
         }
 
         // Push to log writer (unbounded — never blocks)
-        if let Some(ref ltx) = log_tx {
-            let _ = ltx.send(frame.clone());
+        if !cli.interactive {
+            if let Some(session) = log_session.lock().unwrap().as_ref() {
+                let _ = session.tx.send(frame.clone());
+            }
         }
 
         // Push to display (unbounded — never blocks)
@@ -3122,17 +3250,17 @@ fn main() {
 
     // Drop senders to signal recorder and display threads to drain and exit.
     drop(rec_tx);
-    drop(log_tx);
     drop(disp_tx);
-    if let Some(handle) = log_handle {
-        match handle.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("warning: log writer failed: {e}"),
-            Err(_) => eprintln!("warning: log writer thread panicked"),
-        }
-    }
     if let Some(handle) = display_handle {
         let _ = handle.join();
+    }
+    // The display can no longer start a session; drain the writer before exit.
+    let session = log_session.lock().unwrap().take();
+    let log_file_path = session.as_ref().map(|session| session.path.clone());
+    if let Some(session) = session {
+        if let Err(err) = session.finish() {
+            eprintln!("warning: log writer failed: {err}");
+        }
     }
 
     eprintln!(
@@ -3294,6 +3422,66 @@ mod tests {
             format_candump_log_line(&frame, "vcan0"),
             "(0.000042) vcan0 18FF50E5##3112233"
         );
+    }
+
+    #[test]
+    fn late_logging_rotates_flushes_and_optionally_includes_buffer() {
+        let directory = std::env::temp_dir().join(format!(
+            "mcandump-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("capture.log");
+        let first = sample_frame(0x123, &[1]);
+        let second = sample_frame(0x456, &[2]);
+        let third = sample_frame(0x789, &[3]);
+        let expected = |frames: &[RxFrame]| {
+            frames
+                .iter()
+                .map(|frame| format!("{}\n", format_candump_log_line(frame, "vcan0")))
+                .collect::<String>()
+        };
+        let mut state = InteractiveState::new();
+        state.push_frame(first.clone());
+        state.start_logging("vcan0", false, path.clone());
+        state.push_frame(second.clone());
+        state.start_logging("vcan0", true, path.clone());
+        // Rotation waits for the previous file's flush; lowercase excludes history.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            expected(&[second.clone()])
+        );
+        state.push_frame(third.clone());
+        state.start_logging("vcan0", false, path.clone());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("capture-1.log")).unwrap(),
+            expected(&[first, second, third.clone()])
+        );
+        // A failed replacement must preserve the active session.
+        state.start_logging("vcan0", true, directory.join("missing/capture.log"));
+        assert!(state.status.starts_with("Cannot start log:"));
+        assert_eq!(
+            state.log_session.lock().unwrap().as_ref().unwrap().path,
+            directory.join("capture-2.log")
+        );
+        state.push_frame(third.clone());
+        state
+            .log_session
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .finish()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.join("capture-2.log")).unwrap(),
+            expected(&[third])
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
