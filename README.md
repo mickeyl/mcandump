@@ -39,6 +39,10 @@ when you're staring at bus traffic:
 - **Light/dark theme aware** — auto-detects the terminal background
   via OSC 11 (with a `COLORFGBG` fallback) and picks a palette that
   actually reads on paper-colored terminal schemes
+- **All interfaces by default** — without an interface argument
+  mcandump listens on every CAN interface (like `candump any`) and
+  shows the receiving interface on each line, in logs, and in
+  interactive mode
 - **Automatic terminal title** — on a TTY, OSC 0 shows the active
   interface, link/CAN state, nominal bitrate, and CAN-FD data bitrate;
   redirected output remains free of escape sequences
@@ -102,9 +106,11 @@ supports the compact 8-byte Classic CAN quality format.
 - **Interactive mode** — alternate-screen terminal UI with unbounded
   in-memory scrollback, cursor/page navigation, and search for payload
   byte sequences or arbitration IDs. Subtle per-column color coding
-  keeps the display readable without visual noise; the interface name
-  and session mode are shown once in the status bar (e.g.
-  `pos: 287/287  can0: live`) instead of on every row. A live tail
+  keeps the display readable without visual noise; with a single
+  interface its name and the session mode are shown once in the status
+  bar (e.g. `pos: 287/287  can0: live`) instead of on every row. When
+  listening on all interfaces, every row carries its interface and the
+  status bar reads `any: live`. A live tail
   pane appears automatically when you scroll away from the latest
   frames, so you never lose sight of current traffic — resize it on
   the fly with `Shift+↑`/`Shift+↓`. Vim-style visual selection (`v` +
@@ -169,6 +175,9 @@ for the user-visible changes in each published release.
 ## Usage
 
 ```bash
+# Listen on all CAN interfaces; each line names the receiving interface
+mcandump
+
 # Basic usage — display CAN traffic on the terminal (no network side effects)
 mcandump can0
 
@@ -206,6 +215,12 @@ mcandump can1 --quiet --quality-test --quality-id 0x700 --quality-strict
 mcandump can1 --quiet --quality-test --quality-id 0x700 \
     --quality-response-id 0x701 --quality-test-id 1 --quality-strict
 ```
+
+Without an interface argument (or with `any`), mcandump binds to all CAN
+interfaces at once, including ones that appear while it runs. `--serve` and
+`--quality-test` require an explicit interface: the ECUconnect protocol carries
+no channel, and local echoes on other interfaces would distort the quality
+statistics.
 
 Quality mode understands the legacy 8-byte `CA FE` format and the versioned
 64-byte CAN-FD `CA FD` format produced by `mcangen --fd --data-mode

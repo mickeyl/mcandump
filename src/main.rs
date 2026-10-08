@@ -99,6 +99,57 @@ struct RxFrame {
     data: [u8; 64],
     timestamp_us: u64,
     kernel_drops: u32,
+    /// Receiving SocketCAN interface, resolved from the kernel's per-frame
+    /// source address so `any` captures stay attributable.
+    iface: Arc<str>,
+}
+
+/// Pseudo interface name meaning "all CAN interfaces" (bind to ifindex 0),
+/// matching `candump any`.
+const ANY_INTERFACE: &str = "any";
+
+/// Caches `if_indextoname()` lookups for the receive loop.
+#[derive(Default)]
+struct IfaceNames {
+    names: HashMap<libc::c_int, Arc<str>>,
+}
+
+impl IfaceNames {
+    fn get(&mut self, ifindex: libc::c_int) -> Arc<str> {
+        self.names
+            .entry(ifindex)
+            .or_insert_with(|| {
+                let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
+                let ptr =
+                    unsafe { libc::if_indextoname(ifindex as libc::c_uint, buf.as_mut_ptr()) };
+                if ptr.is_null() {
+                    format!("if{ifindex}").into()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(ptr) }
+                        .to_string_lossy()
+                        .as_ref()
+                        .into()
+                }
+            })
+            .clone()
+    }
+}
+
+/// List the CAN interfaces present on this system (ARPHRD_CAN = 280).
+fn list_can_interfaces() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/net") else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            std::fs::read_to_string(entry.path().join("type"))
+                .is_ok_and(|kind| kind.trim() == "280")
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────
@@ -152,8 +203,9 @@ enum YankTarget {
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// CAN interface name (e.g. vcan0, can0)
-    interface: String,
+    /// CAN interface name (e.g. vcan0, can0); omit or pass `any` to listen
+    /// on all CAN interfaces
+    interface: Option<String>,
 
     /// Timestamp display mode
     #[arg(short = 't', long, value_enum, default_value_t = TimestampMode::Absolute)]
@@ -509,31 +561,34 @@ impl Colors {
 
 // ── Socket helpers ────────────────────────────────────────────────────────
 
-/// Open a CAN socket. Returns `(fd, hw_timestamps)` where `hw_timestamps`
+/// Open a CAN socket on `ifname`, or on all CAN interfaces (ifindex 0) when
+/// `ifname` is `None`. Returns `(fd, hw_timestamps)` where `hw_timestamps`
 /// is true if hardware timestamping was successfully enabled.
-fn open_can_socket(ifname: &str, enable_fd: bool) -> io::Result<(i32, bool)> {
+fn open_can_socket(ifname: Option<&str>, enable_fd: bool) -> io::Result<(i32, bool)> {
     unsafe {
         let fd = libc::socket(PF_CAN, libc::SOCK_RAW, CAN_RAW);
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        // Resolve interface index
+        // Resolve interface index; 0 binds to every CAN interface.
         let mut ifr: Ifreq = mem::zeroed();
-        let name_bytes = ifname.as_bytes();
-        if name_bytes.len() >= libc::IFNAMSIZ {
-            libc::close(fd);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "interface name too long",
-            ));
-        }
-        ifr.ifr_name[..name_bytes.len()].copy_from_slice(name_bytes);
+        if let Some(ifname) = ifname {
+            let name_bytes = ifname.as_bytes();
+            if name_bytes.len() >= libc::IFNAMSIZ {
+                libc::close(fd);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "interface name too long",
+                ));
+            }
+            ifr.ifr_name[..name_bytes.len()].copy_from_slice(name_bytes);
 
-        if libc::ioctl(fd, SIOCGIFINDEX, &mut ifr as *mut Ifreq) < 0 {
-            let e = io::Error::last_os_error();
-            libc::close(fd);
-            return Err(e);
+            if libc::ioctl(fd, SIOCGIFINDEX, &mut ifr as *mut Ifreq) < 0 {
+                let e = io::Error::last_os_error();
+                libc::close(fd);
+                return Err(e);
+            }
         }
 
         // Enable CAN-FD reception
@@ -636,14 +691,18 @@ fn open_can_socket(ifname: &str, enable_fd: bool) -> io::Result<(i32, bool)> {
 /// Read a single CAN or CAN-FD frame from the socket.
 ///
 /// Returns `None` for error/RTR frames (silently skipped) or on timeout.
-fn read_frame(fd: i32) -> io::Result<Option<RxFrame>> {
+fn read_frame(fd: i32, iface_names: &mut IfaceNames) -> io::Result<Option<RxFrame>> {
     let mut buf = [0u8; CANFD_FRAME_SIZE];
     let mut cmsg_buf = [0u8; 256]; // room for ancillary timestamp data
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
         iov_len: CANFD_FRAME_SIZE,
     };
+    // The source address carries the receiving interface index.
+    let mut addr: SockaddrCan = unsafe { mem::zeroed() };
     let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_name = &mut addr as *mut SockaddrCan as *mut libc::c_void;
+    msg.msg_namelen = mem::size_of::<SockaddrCan>() as libc::socklen_t;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
@@ -707,6 +766,7 @@ fn read_frame(fd: i32) -> io::Result<Option<RxFrame>> {
         data,
         timestamp_us,
         kernel_drops,
+        iface: iface_names.get(addr.can_ifindex),
     }))
 }
 
@@ -1167,23 +1227,24 @@ fn format_candump_frame(frame: &RxFrame) -> String {
     out
 }
 
-fn format_candump_log_line(frame: &RxFrame, iface: &str) -> String {
+fn format_candump_log_line(frame: &RxFrame) -> String {
     let seconds = frame.timestamp_us / 1_000_000;
     let micros = frame.timestamp_us % 1_000_000;
     format!(
-        "({seconds}.{micros:06}) {iface} {}",
+        "({seconds}.{micros:06}) {} {}",
+        frame.iface,
         format_candump_frame(frame)
     )
 }
 
-fn run_log_writer(rx: mpsc::Receiver<RxFrame>, iface: String, file: File) -> io::Result<()> {
+fn run_log_writer(rx: mpsc::Receiver<RxFrame>, file: File) -> io::Result<()> {
     unsafe {
         libc::nice(10);
     }
 
     let mut writer = io::BufWriter::new(file);
     for frame in rx {
-        writeln!(writer, "{}", format_candump_log_line(&frame, &iface))?;
+        writeln!(writer, "{}", format_candump_log_line(&frame))?;
     }
     writer.flush()
 }
@@ -1195,7 +1256,7 @@ struct LogSession {
 }
 
 impl LogSession {
-    fn start(path: PathBuf, iface: String, create_new: bool) -> io::Result<Self> {
+    fn start(path: PathBuf, create_new: bool) -> io::Result<Self> {
         let file = if create_new {
             File::options().write(true).create_new(true).open(&path)?
         } else {
@@ -1204,7 +1265,7 @@ impl LogSession {
         let (tx, rx) = mpsc::channel();
         let handle = thread::Builder::new()
             .name("log-writer".into())
-            .spawn(move || run_log_writer(rx, iface, file))?;
+            .spawn(move || run_log_writer(rx, file))?;
         Ok(Self { path, tx, handle })
     }
 
@@ -1215,7 +1276,7 @@ impl LogSession {
             .map_err(|_| io::Error::other("log writer thread panicked"))?
     }
 
-    fn start_unique(path: PathBuf, iface: &str) -> io::Result<Self> {
+    fn start_unique(path: PathBuf) -> io::Result<Self> {
         for suffix in 0u64.. {
             let candidate = if suffix == 0 {
                 path.clone()
@@ -1225,7 +1286,7 @@ impl LogSession {
                     path.file_stem().unwrap_or_default().to_string_lossy()
                 ))
             };
-            match Self::start(candidate, iface.to_string(), true) {
+            match Self::start(candidate, true) {
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
                 result => return result,
             }
@@ -1408,7 +1469,6 @@ fn run_recorder(rx: mpsc::Receiver<RxFrame>, manager: Arc<ClientManager>) {
 
 fn run_display(
     rx: mpsc::Receiver<RxFrame>,
-    iface: String,
     ts_mode: TimestampMode,
     colors: Colors,
     log_session: Option<Arc<Mutex<Option<LogSession>>>>,
@@ -1427,14 +1487,7 @@ fn run_display(
                 let _ = session.tx.send(frame.clone());
             }
         }
-        let line = format_frame(
-            &frame,
-            &iface,
-            ts_mode,
-            previous_timestamp_us,
-            &colors,
-            true,
-        );
+        let line = format_frame(&frame, ts_mode, previous_timestamp_us, &colors, true);
         previous_timestamp_us = Some(frame.timestamp_us);
         let mut out = stdout.lock();
         let _ = writeln!(out, "{line}");
@@ -1576,14 +1629,14 @@ impl InteractiveState {
         }
     }
 
-    fn yank_selection(&mut self, iface: &str, fmt: YankFormat) {
+    fn yank_selection(&mut self, fmt: YankFormat) {
         let Some((a, b)) = self.selection_range() else {
             self.status = "Nothing to copy.".to_string();
             return;
         };
         let lines: Vec<String> = (a..=b)
             .map(|i| match fmt {
-                YankFormat::Candump => format_candump_log_line(&self.frames[i], iface),
+                YankFormat::Candump => format_candump_log_line(&self.frames[i]),
                 YankFormat::Hex => format_candump_frame(&self.frames[i]),
             })
             .collect();
@@ -1591,7 +1644,7 @@ impl InteractiveState {
         self.select_anchor = None;
     }
 
-    fn yank_all_matches(&mut self, iface: &str, fmt: YankFormat) {
+    fn yank_all_matches(&mut self, fmt: YankFormat) {
         let Some(search) = self.search.clone() else {
             self.status = "No active search — press / or i first.".to_string();
             return;
@@ -1601,7 +1654,7 @@ impl InteractiveState {
             .iter()
             .filter(|frame| frame_matches(frame, &search))
             .map(|frame| match fmt {
-                YankFormat::Candump => format_candump_log_line(frame, iface),
+                YankFormat::Candump => format_candump_log_line(frame),
                 YankFormat::Hex => format_candump_frame(frame),
             })
             .collect();
@@ -1612,7 +1665,7 @@ impl InteractiveState {
         self.deliver_yank(&lines, fmt, "Copied matches for");
     }
 
-    fn yank_all(&mut self, iface: &str, fmt: YankFormat) {
+    fn yank_all(&mut self, fmt: YankFormat) {
         if self.frames.is_empty() {
             self.status = "Buffer is empty.".to_string();
             return;
@@ -1621,7 +1674,7 @@ impl InteractiveState {
             .frames
             .iter()
             .map(|frame| match fmt {
-                YankFormat::Candump => format_candump_log_line(frame, iface),
+                YankFormat::Candump => format_candump_log_line(frame),
                 YankFormat::Hex => format_candump_frame(frame),
             })
             .collect();
@@ -1768,9 +1821,9 @@ impl InteractiveState {
         false
     }
 
-    fn start_logging(&mut self, iface: &str, include_buffer: bool, path: PathBuf) {
+    fn start_logging(&mut self, include_buffer: bool, path: PathBuf) {
         // Create the replacement first so an open failure leaves the active log intact.
-        let session = match LogSession::start_unique(path, iface) {
+        let session = match LogSession::start_unique(path) {
             Ok(session) => session,
             Err(err) => {
                 self.status = format!("Cannot start log: {err}");
@@ -1804,14 +1857,7 @@ impl InteractiveState {
         *active = Some(session);
     }
 
-    fn handle_key(
-        &mut self,
-        key: KeyEvent,
-        page_rows: usize,
-        body_rows: usize,
-        iface: &str,
-        stop: &AtomicBool,
-    ) {
+    fn handle_key(&mut self, key: KeyEvent, page_rows: usize, body_rows: usize, stop: &AtomicBool) {
         if let Some(prompt) = self.prompt.as_mut() {
             match key.code {
                 KeyCode::Esc => {
@@ -1851,17 +1897,15 @@ impl InteractiveState {
             KeyCode::Char('i') => self.start_prompt(PromptKind::ArbitrationId),
             KeyCode::Char('n') => self.repeat_search(true),
             KeyCode::Char('N') => self.repeat_search(false),
-            KeyCode::Char(c @ ('l' | 'L')) => self.start_logging(
-                iface,
-                c == 'L',
-                PathBuf::from(default_candump_log_filename()),
-            ),
+            KeyCode::Char(c @ ('l' | 'L')) => {
+                self.start_logging(c == 'L', PathBuf::from(default_candump_log_filename()))
+            }
             KeyCode::Char('v') => self.toggle_visual(),
-            KeyCode::Char('y') => self.yank_selection(iface, YankFormat::Candump),
-            KeyCode::Char('Y') => self.yank_selection(iface, YankFormat::Hex),
-            KeyCode::Char('V') => self.yank_all_matches(iface, YankFormat::Candump),
-            KeyCode::Char('a') => self.yank_all(iface, YankFormat::Candump),
-            KeyCode::Char('A') => self.yank_all(iface, YankFormat::Hex),
+            KeyCode::Char('y') => self.yank_selection(YankFormat::Candump),
+            KeyCode::Char('Y') => self.yank_selection(YankFormat::Hex),
+            KeyCode::Char('V') => self.yank_all_matches(YankFormat::Candump),
+            KeyCode::Char('a') => self.yank_all(YankFormat::Candump),
+            KeyCode::Char('A') => self.yank_all(YankFormat::Hex),
             KeyCode::Esc => {
                 if self.select_anchor.take().is_some() {
                     self.status = "Selection cancelled.".to_string();
@@ -1960,11 +2004,14 @@ fn run_interactive_display(
         Ok(terminal) => terminal,
         Err(err) => {
             eprintln!("warning: interactive mode unavailable: {err}");
-            run_display(rx, iface, ts_mode, colors, Some(log_session));
+            run_display(rx, ts_mode, colors, Some(log_session));
             return;
         }
     };
 
+    // A single interface is named once in the status bar; `any` captures
+    // need it per row.
+    let show_iface = iface == ANY_INTERFACE;
     let mut state = InteractiveState::new();
     state.yank_target = yank_target;
     state.log_session = log_session;
@@ -1984,9 +2031,14 @@ fn run_interactive_display(
         }
 
         if needs_redraw {
-            if let Err(err) =
-                draw_interactive(&mut terminal.stdout, &mut state, &iface, ts_mode, &colors)
-            {
+            if let Err(err) = draw_interactive(
+                &mut terminal.stdout,
+                &mut state,
+                &iface,
+                show_iface,
+                ts_mode,
+                &colors,
+            ) {
                 state.status = format!("render error: {err}");
             } else {
                 needs_redraw = false;
@@ -2022,7 +2074,7 @@ fn run_interactive_display(
                     };
                     let sep_rows = if tail_rows > 0 { 1 } else { 0 };
                     let page_rows = body_rows - tail_rows - sep_rows;
-                    state.handle_key(key, page_rows, body_rows, &iface, &stop);
+                    state.handle_key(key, page_rows, body_rows, &stop);
                     needs_redraw = true;
                 }
                 Ok(Event::Resize(_, _)) => needs_redraw = true,
@@ -2047,6 +2099,7 @@ fn draw_interactive(
     stdout: &mut io::Stdout,
     state: &mut InteractiveState,
     iface: &str,
+    show_iface: bool,
     ts_mode: TimestampMode,
     colors: &Colors,
 ) -> io::Result<()> {
@@ -2123,11 +2176,10 @@ fn draw_interactive(
                     "{prefix}{}",
                     format_frame(
                         &state.frames[idx],
-                        iface,
                         ts_mode,
                         previous_timestamp_us,
                         &plain,
-                        false,
+                        show_iface,
                     )
                 );
                 let padded = format!("{line:<width$}", width = cols as usize);
@@ -2147,6 +2199,7 @@ fn draw_interactive(
                         ts_mode,
                         previous_timestamp_us,
                         colors,
+                        show_iface,
                     )
                 );
                 let truncated = truncate_to_visible_width(&line, cols as usize);
@@ -2186,6 +2239,7 @@ fn draw_interactive(
                         ts_mode,
                         previous_timestamp_us,
                         colors,
+                        show_iface,
                     )
                 );
                 let truncated = truncate_to_visible_width(&line, cols as usize);
@@ -2691,6 +2745,24 @@ fn format_can_terminal_title(ifname: &str, config: Option<&CanInterfaceConfig>) 
     parts.join(" · ")
 }
 
+/// Title for `any` captures: one compact entry per interface with its
+/// nominal and (if configured) CAN-FD data bitrate.
+fn format_any_terminal_title(ifaces: &[(String, Option<CanInterfaceConfig>)]) -> String {
+    let mut parts = vec!["mcandump".to_string(), ANY_INTERFACE.to_string()];
+    for (name, config) in ifaces {
+        let mut entry = name.clone();
+        if let Some(bitrate) = config.as_ref().and_then(|config| config.bitrate) {
+            entry.push(' ');
+            entry.push_str(&format_bitrate(bitrate));
+        }
+        if let Some(bitrate) = config.as_ref().and_then(|config| config.data_bitrate) {
+            entry.push_str(&format!(" / FD {}", format_bitrate(bitrate)));
+        }
+        parts.push(entry);
+    }
+    parts.join(" · ")
+}
+
 /// Automatically advertise the active CAN configuration in the terminal
 /// title. The title stack is an xterm-compatible extension; terminals that do
 /// not implement it simply keep mcandump's title after exit.
@@ -2737,6 +2809,7 @@ fn format_frame_interactive(
     ts_mode: TimestampMode,
     previous_timestamp_us: Option<u64>,
     colors: &Colors,
+    show_iface: bool,
 ) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(512);
@@ -2763,9 +2836,11 @@ fn format_frame_interactive(
         TimestampMode::None => {}
     }
 
-    // (Interface name is shown once in the status bar for the interactive TUI
-    // — it's a constant for the life of the session, so repeating it per row
-    // just wastes screen real estate.)
+    // Interface — only when capturing on `any`. With a single interface it is
+    // shown once in the status bar instead of wasting a column per row.
+    if show_iface {
+        let _ = write!(out, "\x1b[{}m{:>8}  ", colors.iface_code(), frame.iface);
+    }
 
     // CAN ID — stable per-ID color
     let id_code = colors.id_color(frame.can_id);
@@ -2858,7 +2933,6 @@ fn truncate_to_visible_width(text: &str, width: usize) -> String {
 
 fn format_frame(
     frame: &RxFrame,
-    iface: &str,
     ts_mode: TimestampMode,
     previous_timestamp_us: Option<u64>,
     colors: &Colors,
@@ -2890,7 +2964,7 @@ fn format_frame(
 
     // Interface
     if show_iface {
-        out.push_str(&colors.paint(&format!("{iface:>8}"), colors.iface_code()));
+        out.push_str(&colors.paint(&format!("{:>8}", frame.iface), colors.iface_code()));
         out.push_str("  ");
     }
 
@@ -3016,11 +3090,43 @@ fn main() {
     // as an implicit --serve so users don't have to spell both out.
     let serve = cli.serve || cli.service_name.is_some();
 
+    // Without an interface argument (or with `any`) listen on every CAN
+    // interface. Features whose output cannot carry the source interface
+    // need an explicit one.
+    let single_iface = cli.interface.clone().filter(|name| name != ANY_INTERFACE);
+    let iface_label = single_iface.as_deref().unwrap_or(ANY_INTERFACE).to_string();
+    let any_ifaces = if single_iface.is_none() {
+        if serve {
+            eprintln!(
+                "error: --serve needs an explicit CAN interface (the ECUconnect protocol carries no channel)"
+            );
+            std::process::exit(1);
+        }
+        if cli.quality_test {
+            eprintln!(
+                "error: --quality-test needs an explicit CAN interface (local echoes on other interfaces would skew the statistics)"
+            );
+            std::process::exit(1);
+        }
+        let ifaces = list_can_interfaces();
+        if ifaces.is_empty() {
+            eprintln!("error: no CAN interfaces found; pass an interface name explicitly");
+            std::process::exit(1);
+        }
+        Some(ifaces)
+    } else {
+        None
+    };
+    let interface_desc = match &any_ifaces {
+        Some(ifaces) => format!("{ANY_INTERFACE} ({})", ifaces.join(", ")),
+        None => iface_label.clone(),
+    };
+
     // Open CAN socket (do this early to fail fast on permission errors)
-    let (fd, hw_timestamps) = match open_can_socket(&cli.interface, true) {
+    let (fd, hw_timestamps) = match open_can_socket(single_iface.as_deref(), true) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("error: cannot open {}: {e}", cli.interface);
+            eprintln!("error: cannot open {iface_label}: {e}");
             if e.raw_os_error() == Some(libc::EPERM) {
                 eprintln!("hint: try running with CAP_NET_RAW or as root");
             }
@@ -3046,7 +3152,7 @@ fn main() {
             "{} {} mcandump starting — interface: {}, TCP port: {p}, timestamps: {}",
             timestamp_now(),
             log_colors.tag("init", "34"),
-            cli.interface,
+            interface_desc,
             if hw_timestamps {
                 "hardware"
             } else {
@@ -3057,7 +3163,7 @@ fn main() {
             "{} {} mcandump starting — interface: {}, timestamps: {} (logger off; pass --serve to enable CANcorder)",
             timestamp_now(),
             log_colors.tag("init", "34"),
-            cli.interface,
+            interface_desc,
             if hw_timestamps {
                 "hardware"
             } else {
@@ -3106,9 +3212,9 @@ fn main() {
     let log_session = Arc::new(Mutex::new(None));
     if let Some(ref path) = log_file_path {
         let session = if auto_log_name {
-            LogSession::start_unique(path.clone(), &cli.interface)
+            LogSession::start_unique(path.clone())
         } else {
-            LogSession::start(path.clone(), cli.interface.clone(), false)
+            LogSession::start(path.clone(), false)
         };
         match session {
             Ok(session) => {
@@ -3133,7 +3239,7 @@ fn main() {
     // or recording.  Gets its own unbounded channel.
     let (disp_tx, display_handle) = if !cli.quiet {
         let (tx, rx) = mpsc::channel::<RxFrame>();
-        let iface = cli.interface.clone();
+        let iface = iface_label.clone();
         let ts_mode = cli.timestamp;
         let colors = Colors::new(!cli.no_color, is_light);
         let stop = stop.clone();
@@ -3154,7 +3260,7 @@ fn main() {
                         log_session,
                     );
                 } else {
-                    run_display(rx, iface, ts_mode, colors, None);
+                    run_display(rx, ts_mode, colors, None);
                 }
             })
             .expect("cannot spawn display thread");
@@ -3167,7 +3273,7 @@ fn main() {
     let zeroconf = if let Some(port) = port {
         match start_zeroconf(
             port,
-            &cli.interface,
+            &iface_label,
             cli.service_name.as_deref(),
             &log_colors,
             !cli.interactive,
@@ -3184,11 +3290,19 @@ fn main() {
 
     // OSC 0 is emitted only when stdout is a TTY, so candump-compatible pipes
     // and redirected output never contain terminal control sequences.
-    let interface_config = get_can_interface_config(&cli.interface);
-    let terminal_title = TerminalTitle::set(&format_can_terminal_title(
-        &cli.interface,
-        interface_config.as_ref(),
-    ));
+    let title = match &any_ifaces {
+        Some(ifaces) => format_any_terminal_title(
+            &ifaces
+                .iter()
+                .map(|name| (name.clone(), get_can_interface_config(name)))
+                .collect::<Vec<_>>(),
+        ),
+        None => format_can_terminal_title(
+            &iface_label,
+            get_can_interface_config(&iface_label).as_ref(),
+        ),
+    };
+    let terminal_title = TerminalTitle::set(&title);
 
     if !cli.interactive {
         eprintln!(
@@ -3205,12 +3319,13 @@ fn main() {
     let mut frame_count: u64 = 0;
     let mut error_count: u64 = 0;
     let start_time = Instant::now();
+    let mut iface_names = IfaceNames::default();
     let mut quality = cli.quality_test.then(|| {
         QualityAnalyzer::new(cli.quality_id, cli.quality_response_id, cli.quality_test_id)
     });
 
     while !stop.load(Ordering::Relaxed) {
-        let frame = match read_frame(fd) {
+        let frame = match read_frame(fd, &mut iface_names) {
             Ok(Some(f)) => f,
             Ok(None) => continue, // timeout, error frame, or RTR — just loop
             Err(e) => {
@@ -3349,6 +3464,7 @@ mod tests {
             data: payload,
             timestamp_us: 0,
             kernel_drops: 0,
+            iface: "vcan0".into(),
         }
     }
 
@@ -3416,8 +3532,9 @@ mod tests {
     fn formats_classic_candump_log_line() {
         let mut frame = sample_frame(0x123, &[0xDE, 0xAD, 0xBE, 0xEF]);
         frame.timestamp_us = 1_712_345_678_901_234;
+        frame.iface = "can0".into();
         assert_eq!(
-            format_candump_log_line(&frame, "can0"),
+            format_candump_log_line(&frame),
             "(1712345678.901234) can0 123#DEADBEEF"
         );
     }
@@ -3431,7 +3548,7 @@ mod tests {
         frame.esi = true;
         frame.timestamp_us = 42;
         assert_eq!(
-            format_candump_log_line(&frame, "vcan0"),
+            format_candump_log_line(&frame),
             "(0.000042) vcan0 18FF50E5##3112233"
         );
     }
@@ -3454,27 +3571,27 @@ mod tests {
         let expected = |frames: &[RxFrame]| {
             frames
                 .iter()
-                .map(|frame| format!("{}\n", format_candump_log_line(frame, "vcan0")))
+                .map(|frame| format!("{}\n", format_candump_log_line(frame)))
                 .collect::<String>()
         };
         let mut state = InteractiveState::new();
         state.push_frame(first.clone());
-        state.start_logging("vcan0", false, path.clone());
+        state.start_logging(false, path.clone());
         state.push_frame(second.clone());
-        state.start_logging("vcan0", true, path.clone());
+        state.start_logging(true, path.clone());
         // Rotation waits for the previous file's flush; lowercase excludes history.
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
-            expected(&[second.clone()])
+            expected(std::slice::from_ref(&second))
         );
         state.push_frame(third.clone());
-        state.start_logging("vcan0", false, path.clone());
+        state.start_logging(false, path.clone());
         assert_eq!(
             std::fs::read_to_string(directory.join("capture-1.log")).unwrap(),
             expected(&[first, second, third.clone()])
         );
         // A failed replacement must preserve the active session.
-        state.start_logging("vcan0", true, directory.join("missing/capture.log"));
+        state.start_logging(true, directory.join("missing/capture.log"));
         assert!(state.status.starts_with("Cannot start log:"));
         assert_eq!(
             state.log_session.lock().unwrap().as_ref().unwrap().path,
@@ -3538,17 +3655,17 @@ mod tests {
         assert!(filename.starts_with("candump-"));
         assert!(filename.ends_with(".log"));
         assert_eq!(filename.len(), "candump-2026-09-25_123456.log".len());
-        let first = LogSession::start_unique(path.clone(), "can0").unwrap();
+        let first = LogSession::start_unique(path.clone()).unwrap();
         let frame = sample_frame(0x123, &[0xCA, 0xFE]);
         first.tx.send(frame.clone()).unwrap();
         first.finish().unwrap();
-        let second = LogSession::start_unique(path.clone(), "can0").unwrap();
+        let second = LogSession::start_unique(path.clone()).unwrap();
         assert_ne!(second.path, path);
         assert_eq!(second.path.parent(), Some(directory.as_path()));
         second.finish().unwrap();
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
-            format!("{}\n", format_candump_log_line(&frame, "can0"))
+            format!("{}\n", format_candump_log_line(&frame))
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -3689,5 +3806,55 @@ mod tests {
     #[test]
     fn terminal_title_without_ip_details_still_names_interface() {
         assert_eq!(format_can_terminal_title("vcan0", None), "mcandump · vcan0");
+    }
+
+    #[test]
+    fn interface_argument_is_optional() {
+        assert_eq!(Cli::try_parse_from(["mcandump"]).unwrap().interface, None);
+        assert_eq!(
+            Cli::try_parse_from(["mcandump", "can1"]).unwrap().interface,
+            Some("can1".to_string())
+        );
+    }
+
+    #[test]
+    fn candump_log_line_uses_per_frame_interface() {
+        let mut first = sample_frame(0x123, &[0x01]);
+        first.iface = "can0".into();
+        let mut second = sample_frame(0x123, &[0x01]);
+        second.iface = "can1".into();
+        assert_eq!(format_candump_log_line(&first), "(0.000000) can0 123#01");
+        assert_eq!(format_candump_log_line(&second), "(0.000000) can1 123#01");
+    }
+
+    #[test]
+    fn interactive_rows_show_interface_only_when_requested() {
+        let colors = Colors::new(true, false);
+        let mut frame = sample_frame(0x123, &[0x01]);
+        frame.iface = "can1".into();
+        let with = format_frame_interactive(&frame, TimestampMode::None, None, &colors, true);
+        let without = format_frame_interactive(&frame, TimestampMode::None, None, &colors, false);
+        assert!(with.contains("    can1  "));
+        assert!(!without.contains("can1"));
+        // The highlighted row (plain format_frame) must keep the same layout.
+        let plain = Colors::new(false, false);
+        let highlighted = format_frame(&frame, TimestampMode::None, None, &plain, true);
+        assert!(highlighted.starts_with("    can1       123"));
+    }
+
+    #[test]
+    fn any_terminal_title_lists_each_interface() {
+        let can0 = CanInterfaceConfig {
+            bitrate: Some(500_000),
+            data_bitrate: Some(2_000_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_any_terminal_title(&[
+                ("can0".to_string(), Some(can0)),
+                ("vcan0".to_string(), None),
+            ]),
+            "mcandump · any · can0 500 kbit/s / FD 2 Mbit/s · vcan0"
+        );
     }
 }

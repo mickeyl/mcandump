@@ -5,6 +5,15 @@ published as GitHub releases. Changes made under intermediate version numbers
 without a published release are included in the next version users could
 download.
 
+## [2.10.0] - 2026-10-08
+
+- Without an interface argument (or with `any`), mcandump now listens on all
+  CAN interfaces, including ones that appear while it runs.
+- The receiving interface is shown on every line, written to candump logs and
+  yanks, and displayed as a per-row column in interactive mode when listening
+  on all interfaces. The terminal title lists each interface with its bitrates.
+- `--serve` and `--quality-test` require an explicit interface.
+
 ## [2.9.1] - 2026-09-25
 
 - Fixed `-f` / `--log-file` with an existing directory: create a timestamped

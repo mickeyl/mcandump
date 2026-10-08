@@ -1,12 +1,13 @@
-.TH MCANDUMP 1 "September 2026" "mcandump 2.9.1" "User Commands"
+.TH MCANDUMP 1 "October 2026" "mcandump 2.10.0" "User Commands"
 .SH NAME
 mcandump \- SocketCAN dumper and optional CANcorder logger proxy
 .SH SYNOPSIS
 .B mcandump
-.RI [ OPTIONS ] " <interface>"
+.RI [ OPTIONS ] " [interface]"
 .SH DESCRIPTION
 .B mcandump
-reads CAN and CAN-FD frames from a Linux SocketCAN interface and prints them in
+reads CAN and CAN-FD frames from a Linux SocketCAN interface \(em or, without an
+interface argument, from all CAN interfaces of the system \(em and prints them in
 a candump-like terminal view. With
 .BR --serve ,
 it also forwards the same traffic to CANcorder clients via the ECUconnect
@@ -32,12 +33,22 @@ mcandump switches the terminal into an alternate-screen interactive viewer with
 scrollback, cursor navigation, and search.
 .SH ARGUMENTS
 .TP
-.I <interface>
+.I [interface]
 SocketCAN interface name, for example
 .BR can0 ,
 .BR vcan0 ,
 or
 .BR slcan0 .
+When omitted (or given as
+.BR any ),
+mcandump listens on all CAN interfaces, including ones that appear while it
+runs, and shows the receiving interface on every line, in log files, and in
+interactive mode. The terminal title then lists each interface with its
+bitrates.
+.B \-\-serve
+and
+.B \-\-quality\-test
+require an explicit interface.
 .SH OPTIONS
 .TP
 .BR \-t ", " \-\-timestamp " <absolute|delta|none>"
@@ -147,9 +158,12 @@ Show version information.
 .SH INTERACTIVE MODE
 Interactive mode uses an alternate terminal screen and keeps all received
 frames in memory so older traffic can be inspected without stopping capture.
-The interface name is shown once in the status bar at the bottom
+With a single interface, its name is shown once in the status bar at the bottom
 .RB ( "pos: N/M  <iface>: <mode>" ),
 not on every row, so the payload and ASCII columns get the full line width.
+When listening on all interfaces, each row carries the receiving interface and
+the status bar shows
+.BR "any: <mode>" .
 .PP
 Available shortcuts:
 .TP
@@ -250,6 +264,9 @@ Cancel the active search prompt or the active visual selection.
 .B q
 Exit mcandump.
 .SH EXAMPLES
+.TP
+.B mcandump
+Read from all CAN interfaces; each line names the receiving interface.
 .TP
 .B mcandump can0
 Read from
