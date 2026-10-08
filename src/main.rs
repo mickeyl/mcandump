@@ -25,6 +25,8 @@ const PF_CAN: i32 = AF_CAN;
 const CAN_RAW: i32 = 1;
 // libc::Ioctl is c_ulong on glibc, c_int on musl — use the alias for portability.
 const SIOCGIFINDEX: libc::Ioctl = 0x8933 as libc::Ioctl;
+const SIOCETHTOOL: libc::Ioctl = 0x8946 as libc::Ioctl;
+const ETHTOOL_GET_TS_INFO: u32 = 0x41;
 const SOL_CAN_RAW: libc::c_int = 101;
 const CAN_RAW_FD_FRAMES: libc::c_int = 5;
 
@@ -80,10 +82,33 @@ struct SockaddrCan {
     can_addr: [u8; 8],
 }
 
+/// `struct ifreq`. The kernel copies the whole struct in and out, so the
+/// union must have its full size (24 bytes on 64-bit, 16 on 32-bit).
 #[repr(C)]
 struct Ifreq {
     ifr_name: [u8; libc::IFNAMSIZ],
+    ifr_ifru: IfreqUnion,
+}
+
+#[repr(C)]
+union IfreqUnion {
     ifr_ifindex: libc::c_int,
+    ifr_data: *mut libc::c_void,
+    _addr: libc::sockaddr,
+    _map: [libc::c_ulong; 3],
+}
+
+/// `struct ethtool_ts_info` from linux/ethtool.h.
+#[repr(C)]
+#[derive(Default)]
+struct EthtoolTsInfo {
+    cmd: u32,
+    so_timestamping: u32,
+    phc_index: i32,
+    tx_types: u32,
+    tx_reserved: [u32; 3],
+    rx_filters: u32,
+    rx_reserved: [u32; 3],
 }
 
 // ── Parsed CAN frame ──────────────────────────────────────────────────────
@@ -612,7 +637,7 @@ fn open_can_socket(ifname: Option<&str>, enable_fd: bool) -> io::Result<(i32, bo
 
         let mut addr: SockaddrCan = mem::zeroed();
         addr.can_family = AF_CAN as libc::sa_family_t;
-        addr.can_ifindex = ifr.ifr_ifindex;
+        addr.can_ifindex = ifr.ifr_ifru.ifr_ifindex;
 
         if libc::bind(
             fd,
@@ -685,6 +710,43 @@ fn open_can_socket(ifname: Option<&str>, enable_fd: bool) -> io::Result<(i32, bo
         );
 
         Ok((fd, got_timestamping))
+    }
+}
+
+/// Ask the driver (ETHTOOL_GET_TS_INFO) whether `ifname` delivers hardware
+/// receive timestamps. CAN drivers that support them always stamp, so no
+/// SIOCSHWTSTAMP is needed. Errors (e.g. no ethtool support) mean software.
+fn iface_has_hw_rx_timestamps(fd: i32, ifname: &str) -> bool {
+    let name_bytes = ifname.as_bytes();
+    if name_bytes.len() >= libc::IFNAMSIZ {
+        return false;
+    }
+    let mut info = EthtoolTsInfo {
+        cmd: ETHTOOL_GET_TS_INFO,
+        ..Default::default()
+    };
+    unsafe {
+        let mut ifr: Ifreq = mem::zeroed();
+        ifr.ifr_name[..name_bytes.len()].copy_from_slice(name_bytes);
+        ifr.ifr_ifru.ifr_data = &mut info as *mut EthtoolTsInfo as *mut libc::c_void;
+        if libc::ioctl(fd, SIOCETHTOOL, &mut ifr as *mut Ifreq) < 0 {
+            return false;
+        }
+    }
+    info.so_timestamping & SOF_TIMESTAMPING_RX_HARDWARE != 0
+}
+
+/// Startup summary of the timestamp source: a single word for one
+/// interface, otherwise `name source` per interface.
+fn format_timestamp_sources(sources: &[(String, bool)]) -> String {
+    let word = |hw: bool| if hw { "hardware" } else { "software" };
+    match sources {
+        [(_, hw)] => word(*hw).to_string(),
+        _ => sources
+            .iter()
+            .map(|(name, hw)| format!("{name} {}", word(*hw)))
+            .collect::<Vec<_>>()
+            .join(", "),
     }
 }
 
@@ -3121,6 +3183,9 @@ fn main() {
         Some(ifaces) => format!("{ANY_INTERFACE} ({})", ifaces.join(", ")),
         None => iface_label.clone(),
     };
+    let monitored_ifaces = any_ifaces
+        .clone()
+        .unwrap_or_else(|| vec![iface_label.clone()]);
 
     // Open CAN socket (do this early to fail fast on permission errors)
     let (fd, hw_timestamps) = match open_can_socket(single_iface.as_deref(), true) {
@@ -3133,6 +3198,16 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Hardware stamps need SO_TIMESTAMPING on the socket and driver support.
+    let timestamps = format_timestamp_sources(
+        &monitored_ifaces
+            .iter()
+            .map(|name| {
+                let hw = hw_timestamps && iface_has_hw_rx_timestamps(fd, name);
+                (name.clone(), hw)
+            })
+            .collect::<Vec<_>>(),
+    );
 
     // Optional: bind TCP server when the CANcorder logger is enabled.
     let (listener, port) = if serve {
@@ -3153,22 +3228,14 @@ fn main() {
             timestamp_now(),
             log_colors.tag("init", "34"),
             interface_desc,
-            if hw_timestamps {
-                "hardware"
-            } else {
-                "software"
-            },
+            timestamps,
         ),
         None => eprintln!(
             "{} {} mcandump starting — interface: {}, timestamps: {} (logger off; pass --serve to enable CANcorder)",
             timestamp_now(),
             log_colors.tag("init", "34"),
             interface_desc,
-            if hw_timestamps {
-                "hardware"
-            } else {
-                "software"
-            },
+            timestamps,
         ),
     }
 
@@ -3855,6 +3922,32 @@ mod tests {
                 ("vcan0".to_string(), None),
             ]),
             "mcandump · any · can0 500 kbit/s / FD 2 Mbit/s · vcan0"
+        );
+    }
+
+    #[test]
+    fn ifreq_matches_kernel_layout() {
+        assert_eq!(
+            mem::size_of::<Ifreq>(),
+            libc::IFNAMSIZ
+                + if cfg!(target_pointer_width = "64") {
+                    24
+                } else {
+                    16
+                }
+        );
+        assert_eq!(mem::size_of::<EthtoolTsInfo>(), 44);
+    }
+
+    #[test]
+    fn formats_timestamp_sources_per_interface() {
+        assert_eq!(
+            format_timestamp_sources(&[("can0".to_string(), true)]),
+            "hardware"
+        );
+        assert_eq!(
+            format_timestamp_sources(&[("can0".to_string(), true), ("vcan0".to_string(), false),]),
+            "can0 hardware, vcan0 software"
         );
     }
 }

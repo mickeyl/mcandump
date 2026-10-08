@@ -5,6 +5,15 @@ published as GitHub releases. Changes made under intermediate version numbers
 without a published release are included in the next version users could
 download.
 
+## [2.10.1] - 2026-10-08
+
+- The startup message now reports the timestamp source per interface
+  (hardware or software), as advertised by the driver, instead of a single
+  value that also claimed hardware timestamps on interfaces without them.
+- Fixed an undersized `ifreq` structure that let the kernel write past it when
+  resolving the interface index.
+- Updated the yanked transitive dependency `spin` to 0.9.9.
+
 ## [2.10.0] - 2026-10-08
 
 - Without an interface argument (or with `any`), mcandump now listens on all
